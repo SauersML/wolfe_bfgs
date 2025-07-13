@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/wolfe-bfgs.svg)](https://crates.io/crates/wolfe-bfgs)
 [![Docs.rs](https://docs.rs/wolfe_bfgs/badge.svg)](https://docs.rs/wolfe_bfgs)
-[![Build Status](https://github.com/SauersML/bfgs/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/bfgs/actions)
+[![Build Status](https://github.com/SauersML/wolfe_bfgs/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/wolfe_bfgs/actions)
 
 A pure Rust implementation of the dense BFGS optimization algorithm for unconstrained nonlinear problems. This library provides a powerful solver built upon the principles and best practices outlined in Nocedal & Wright's *Numerical Optimization*.
 
