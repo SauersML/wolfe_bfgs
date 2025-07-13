@@ -242,17 +242,20 @@ where
             let y_k = &g_next - &g_k;
 
             // --- Cautious Hessian Update ---
+            let sy = s_k.dot(&y_k);
+
             if k == 0 {
                 // For the very first step, apply the scaling heuristic.
-                let sy = s_k.dot(&y_k);
                 let yy = y_k.dot(&y_k);
                 if sy > 1e-10 && yy > 0.0 {
                     b_inv = Array2::eye(n) * (sy / yy);
                 }
             } else {
                 // For all subsequent steps, perform the standard BFGS update.
-                let sy = s_k.dot(&y_k);
-                if sy > 1e-10 {
+                let s_norm = s_k.dot(&s_k).sqrt();
+                let y_norm = y_k.dot(&y_k).sqrt();
+
+                if sy > f64::EPSILON * s_norm * y_norm {
                     let rho = 1.0 / sy;
                     let h_y = b_inv.dot(&y_k);
                     let y_h_y = y_k.dot(&h_y);
@@ -266,8 +269,11 @@ where
                     b_inv.scaled_add(-rho, &hy_s_outer);
                     b_inv.scaled_add(-rho, &s_hy_outer);
                     b_inv.scaled_add(rho * rho * y_h_y + rho, &s_s_outer);
+
+                    // Enforce symmetry to counteract floating-point drift.
+                    b_inv = (&b_inv + &b_inv.t()) * 0.5;
                 } else {
-                    log::debug!("[BFGS] Curvature sy <= 0 ({:.2e}). Skipping Hessian update.", sy);
+                    log::debug!("[BFGS] Curvature condition failed (sy / (||s||*||y||) is too small). Skipping Hessian update.");
                 }
             }
 
@@ -459,6 +465,11 @@ where
 
     for _ in 0..max_zoom_attempts {
         // --- Use cubic interpolation to find a trial step size `alpha_j` ---
+        // If the entire bracket is in an unusable (infinite) region, fail immediately.
+        if !f_lo.is_finite() && !f_hi.is_finite() {
+            log::warn!("[BFGS Zoom] Line search bracketed an infinite region. Aborting.");
+            return Err(BfgsError::LineSearchFailed { max_attempts: max_zoom_attempts });
+        }
         let alpha_j = {
             // Ensure alpha_lo < alpha_hi for stable interpolation.
             if alpha_lo > alpha_hi {
@@ -665,6 +676,33 @@ mod tests {
         (2.0 * x[0] + 3.0 * x[1], array![2.0, 3.0])
     }
 
+    // A highly ill-conditioned quadratic function.
+    // The "valley" is 1000x longer than it is wide.
+    fn ill_conditioned_quadratic(x: &Array1<f64>) -> (f64, Array1<f64>) {
+        let scale = 1000.0;
+        let f = scale * x[0].powi(2) + x[1].powi(2);
+        let g = array![2.0 * scale * x[0], 2.0 * x[1]];
+        (f, g)
+    }
+
+    // This function is minimized anywhere on the line x[0] = -x[1].
+    // Its Hessian is singular.
+    fn singular_hessian_function(x: &Array1<f64>) -> (f64, Array1<f64>) {
+        let val = (x[0] + x[1]).powi(2);
+        (val, array![2.0 * (x[0] + x[1]), 2.0 * (x[0] + x[1])])
+    }
+
+    // Function with a steep exponential "wall".
+    fn wall_with_minimum(x: &Array1<f64>) -> (f64, Array1<f64>) {
+        if x[0] > 70.0 {
+            // The wall
+            (f64::INFINITY, array![f64::INFINITY])
+        } else {
+            // A simple quadratic with minimum at x=60
+            ((x[0] - 60.0).powi(2), array![2.0 * (x[0] - 60.0)])
+        }
+    }
+
     // --- 1. Standard Convergence Tests ---
 
     #[test]
@@ -813,5 +851,57 @@ mod tests {
         // Assert that the number of iterations is very similar.
         let iter_diff = (our_res.iterations as i64 - scipy_res.iterations.unwrap() as i64).abs();
         assert_that(&iter_diff).is_less_than_or_equal_to(5);
+    }
+
+    // --- 4. Robustness Tests ---
+
+    #[test]
+    fn test_ill_conditioned_problem_converges() {
+        let x0 = array![1.0, 1000.0]; // Start far up the narrow valley
+        let BfgsSolution { final_point, iterations, .. } =
+            Bfgs::new(x0, ill_conditioned_quadratic).run().unwrap();
+
+        // It should still converge, even if it takes more iterations.
+        assert_that!(&final_point[0]).is_close_to(0.0, 1e-5);
+        assert_that!(&final_point[1]).is_close_to(0.0, 1e-5);
+        // Expect more iterations than a well-conditioned problem.
+        assert_that!(&iterations).is_greater_than(1);
+    }
+
+    #[test]
+    fn test_singular_hessian_is_handled_gracefully() {
+        let x0 = array![10.0, 20.0];
+        let result = Bfgs::new(x0, singular_hessian_function)
+            .with_tolerance(1e-8)
+            .run();
+
+        // The goal is to ensure the solver doesn't panic or return a numerical error.
+        // It can either converge (if it gets lucky) or hit the max iteration limit.
+        // Both are "graceful" outcomes.
+        match result {
+            Ok(soln) => {
+                // If it did converge, verify it's on the correct line of minima.
+                assert_that!(&soln.final_point[0]).is_close_to(-soln.final_point[1], 1e-5);
+                assert_that!(&soln.final_gradient_norm).is_less_than(1e-8);
+            }
+            Err(BfgsError::MaxIterationsReached { .. }) => {
+                // Hitting the iteration limit is an acceptable and expected outcome. Pass.
+            }
+            Err(e) => {
+                // Any other error (like LineSearchFailed, GradientIsNaN) is a failure.
+                panic!("Solver failed with an unexpected error: {:?}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_line_search_handles_inf() {
+        let x0 = array![10.0]; // Start far from the wall and minimum.
+        let result = Bfgs::new(x0, wall_with_minimum).run();
+
+        // The solver should successfully find the minimum without crashing.
+        // The line search must be robust enough to avoid stepping into the "wall".
+        let soln = result.unwrap();
+        assert_that!(&soln.final_point[0]).is_close_to(60.0, 1e-4);
     }
 }
