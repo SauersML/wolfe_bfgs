@@ -119,6 +119,8 @@ impl<ObjFn> Bfgs<ObjFn>
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
 {
+    const FALLBACK_THRESHOLD: usize = 3;
+
     /// Creates a new BFGS solver.
     ///
     /// # Arguments
@@ -160,7 +162,6 @@ where
         // --- State for the Adaptive Strategy ---
         let mut primary_strategy = LineSearchStrategy::StrongWolfe;
         let mut fallback_streak = 0;
-        const FALLBACK_THRESHOLD: usize = 3;
 
         for k in 0..self.max_iterations {
             let g_norm = g_k.dot(&g_k).sqrt();
@@ -179,6 +180,9 @@ where
             }
 
             let mut present_d_k = -b_inv.dot(&g_k);
+            if present_d_k.iter().all(|&v| v.abs() < 1e-16) {
+                return Err(BfgsError::StepSizeTooSmall);
+            }
             let mut fallback_triggered = false;
 
             // --- Adaptive Hybrid Line Search Execution ---
@@ -196,7 +200,7 @@ where
                     Ok(result) => {
                         // Success with the primary strategy.
                         if matches!(primary_strategy, LineSearchStrategy::Backtracking) {
-                            log::info!("[BFGS Adaptive] Backtracking search succeeded at iter {}. Resetting to Strong Wolfe.", k);
+                            log::debug!("[BFGS Adaptive] Backtracking search succeeded at iter {}. Resetting to Strong Wolfe.", k);
                             primary_strategy = LineSearchStrategy::StrongWolfe;
                         }
                         fallback_streak = 0;
@@ -225,7 +229,7 @@ where
             if fallback_triggered {
                 fallback_streak += 1;
                 // The "Learner" part: promote Backtracking if Wolfe keeps failing.
-                if fallback_streak >= FALLBACK_THRESHOLD {
+                if fallback_streak >= Self::FALLBACK_THRESHOLD {
                     log::warn!("[BFGS Adaptive] Fallback streak ({}) reached. Switching primary to Backtracking.", fallback_streak);
                     primary_strategy = LineSearchStrategy::Backtracking;
                 }
@@ -297,6 +301,9 @@ where
 
     let mut f_prev = f_k;
     let g_k_dot_d = g_k.dot(d_k); // Initial derivative along the search direction.
+    if g_k_dot_d >= 0.0 {
+        log::warn!("[BFGS Wolfe] Non-descent direction detected (gᵀd = {:.2e} >= 0).", g_k_dot_d);
+    }
     let mut g_prev_dot_d = g_k_dot_d;
 
     let max_attempts = 20;
@@ -393,16 +400,18 @@ where
     let max_attempts = 30;
 
     let g_k_dot_d = g_k.dot(d_k);
-    // **BUG FIX**: A backtracking search is only valid on a descent direction.
+    // A backtracking search is only valid on a descent direction.
     if g_k_dot_d > 0.0 {
-        log::error!("[BFGS Backtracking] Search started with a non-descent direction (gᵀd = {:.2e} > 0). This step will likely fail.", g_k_dot_d);
+        log::warn!("[BFGS Backtracking] Search started with a non-descent direction (gᵀd = {:.2e} > 0). This step will likely fail.", g_k_dot_d);
     }
 
-    for i in 0..max_attempts {
+    let mut func_evals = 0;
+    let mut grad_evals = 0;
+    for _ in 0..max_attempts {
         let x_new = x_k + alpha * d_k;
         let (f_new, g_new) = obj_fn(&x_new);
-        let func_evals = i + 1;
-        let grad_evals = i + 1;
+        func_evals += 1;
+        grad_evals += 1;
 
         if f_new.is_finite() && f_new <= f_k + c1 * alpha * g_k_dot_d {
             return Ok((alpha, f_new, g_new, func_evals, grad_evals));
