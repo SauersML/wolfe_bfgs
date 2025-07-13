@@ -213,10 +213,10 @@ where
             // of the inverse Hessian approximation `b_inv`.
 
             // Tier 1: Generate a search direction and attempt a line search.
-            let mut current_d_k = -b_inv.dot(&g_k);
+            let mut present_d_k = -b_inv.dot(&g_k);
 
             let (alpha_k, f_next, g_next, f_evals, g_evals) =
-                match line_search(&self.obj_fn, &x_k, ¤t_d_k, f_k, &g_k, self.c1, self.c2) {
+                match line_search(&self.obj_fn, &x_k, present_d_k, f_k, &g_k, self.c1, self.c2) {
                     Ok(result) => result,
                     Err(_) => {
                         // Tier 2: Failsafe Hessian Reset. The line search failed, indicating
@@ -226,7 +226,7 @@ where
                         b_inv = Array2::<f64>::eye(n);
 
                         // Retry the step with a steepest descent direction.
-                        current_d_k = -g_k.clone();
+                        present_d_k = -g_k.clone();
                         // If this second line search also fails, the problem is deemed
                         // intractable, and the error is propagated.
                         line_search(&self.obj_fn, &x_k, ¤t_d_k, f_k, &g_k, self.c1, self.c2)?
@@ -235,8 +235,8 @@ where
             func_evals += f_evals;
             grad_evals += g_evals;
 
-            // The step `s_k` is now calculated using the search direction that succeeded.
-            let s_k = alpha_k * current_d_k;
+            // The step `s_k` is calculated using the search direction that succeeded.
+            let s_k = alpha_k * present_d_k;
             let y_k = &g_next - &g_k;
 
             let sy = s_k.dot(&y_k);
@@ -333,7 +333,7 @@ where
         // failure of this condition, triggering the zoom phase.
         if !f_i.is_finite() || f_i > f_k + c1 * alpha_i * g_k_dot_d || (func_evals > 1 && f_i >= f_prev)
         {
-            // The minimum is now bracketed between alpha_prev and alpha_i.
+            // The minimum is bracketed between alpha_prev and alpha_i.
             // A non-finite gradient from a non-finite function value is handled
             // robustly by the zoom function.
             let g_i_dot_d = g_i.dot(d_k);
@@ -501,7 +501,7 @@ where
                 return Ok((alpha_j, f_j, g_j, func_evals, grad_evals));
             }
 
-            // The minimum is now bracketed by a point with a negative derivative
+            // The minimum is bracketed by a point with a negative derivative
             // (alpha_lo) and a point with a positive derivative (alpha_j).
             if g_j_dot_d >= 0.0 {
                 // The new point has a positive derivative, so it becomes the new
