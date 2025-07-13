@@ -579,18 +579,6 @@ mod tests {
     //    `argmin`, a trusted, state-of-the-art optimization library, ensuring
     //    that our results (final point and iteration count) are equivalent.
 
-    // --- Cargo.toml setup for tests ---
-    // The tests below require `argmin` and `argmin-math`. Add these to your
-    // `[dev-dependencies]` in Cargo.toml and enable the `ndarray` feature
-    // for `argmin-math`:
-    //
-    // [dev-dependencies]
-    // argmin = "0.10.0"
-    // argmin-math = { version = "0.4.0", features = ["ndarray_latest-nolinalg"] }
-    // ndarray = "0.15"
-    // spectral = "0.6"
-    // thiserror = "1.0"
-
     use super::{Bfgs, BfgsError, BfgsSolution};
     use ndarray::{Array1, array};
     use spectral::prelude::*;
