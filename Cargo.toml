@@ -1,0 +1,23 @@
+[package]
+name = "wolfe_bfgs"
+version = "0.1.1"
+authors = ["Paul Kernfeld <paulkernfeld@gmail.com>", "SauersML"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A dense BFGS optimization algorithm in Rust, with a Strong Wolfe line search and initial Hessian scaling."
+readme = "README.md"
+documentation = "https://github.com/SauersML/"
+repository = "https://github.com/SauersML/bfgs"
+keywords = ["optimization", "bfgs", "science"]
+categories = ["science", "algorithms"]
+
+[workspace]
+
+[dependencies]
+ndarray = "0.16.1"
+thiserror = "2.0.12"
+
+[dev-dependencies]
+spectral = "0.6.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
