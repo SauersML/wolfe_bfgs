@@ -78,8 +78,6 @@ pub enum BfgsError {
     MaxIterationsReached { max_iterations: usize },
     #[error("The gradient norm was NaN or infinity, indicating numerical instability.")]
     GradientIsNaN,
-    #[error("Curvature condition `s_k^T y_k <= 0` was violated after a successful line search. This may indicate severe floating-point precision loss. (sy = {sy:.2e})")]
-    CurvatureConditionViolated { sy: f64 },
     #[error("The line search step size became smaller than machine epsilon, indicating that the algorithm is stuck.")]
     StepSizeTooSmall,
 }
