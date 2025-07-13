@@ -236,7 +236,7 @@ where
             grad_evals += g_evals;
 
             // The step `s_k` is calculated using the search direction that succeeded.
-            let s_k = alpha_k * present_d_k;
+            let s_k = alpha_k * &present_d_k;
             let y_k = &g_next - &g_k;
 
             let sy = s_k.dot(&y_k);
