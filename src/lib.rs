@@ -208,83 +208,78 @@ where
                 });
             }
 
-            let d_k = -b_inv.dot(&g_k);
+            // --- Robustness Strategy: Cautious Updates with Failsafe Reset ---
+            // This section implements a two-tiered strategy to ensure the stability
+            // of the inverse Hessian approximation `b_inv`.
+
+            // Tier 1: Generate a search direction and attempt a line search.
+            let mut current_d_k = -b_inv.dot(&g_k);
+
             let (alpha_k, f_next, g_next, f_evals, g_evals) =
-                match line_search(&self.obj_fn, &x_k, &d_k, f_k, &g_k, self.c1, self.c2) {
+                match line_search(&self.obj_fn, &x_k, ¤t_d_k, f_k, &g_k, self.c1, self.c2) {
                     Ok(result) => result,
                     Err(_) => {
-                        // --- FAILSAFE HESSIAN RESET ---
-                        // The line search failed, indicating the search direction is poor
-                        // and the Hessian approximation is likely corrupt. Resetting is the
-                        // best recovery strategy. This is triggered when the cautious update
-                        // mechanism is insufficient to prevent Hessian ill-conditioning.
+                        // Tier 2: Failsafe Hessian Reset. The line search failed, indicating
+                        // the search direction is poor and `b_inv` is likely corrupt. Resetting
+                        // is the best recovery strategy. This is triggered when the cautious
+                        // update mechanism below is insufficient to prevent ill-conditioning.
                         b_inv = Array2::<f64>::eye(n);
 
                         // Retry the step with a steepest descent direction.
-                        let d_k_new = -g_k.clone();
-                        // If this also fails, the problem is likely intractable.
-                        line_search(&self.obj_fn, &x_k, &d_k_new, f_k, &g_k, self.c1, self.c2)?
+                        current_d_k = -g_k.clone();
+                        // If this second line search also fails, the problem is deemed
+                        // intractable, and the error is propagated.
+                        line_search(&self.obj_fn, &x_k, ¤t_d_k, f_k, &g_k, self.c1, self.c2)?
                     }
                 };
             func_evals += f_evals;
             grad_evals += g_evals;
 
-            let s_k = alpha_k * d_k;
+            // The step `s_k` is now calculated using the search direction that succeeded.
+            let s_k = alpha_k * current_d_k;
             let y_k = &g_next - &g_k;
 
             let sy = s_k.dot(&y_k);
 
-            // A valid Wolfe line search should always ensure sy > 0.
-            // This check is a safeguard against potential floating-point issues or
-            // if a non-Wolfe line search were ever used.
+            // A valid Wolfe line search should always ensure sy > 0. This check is a
+            // safeguard against potential floating-point issues.
             if sy <= 1e-14 {
                 return Err(BfgsError::CurvatureConditionViolated);
             }
 
-            // --- CAUTIOUS UPDATE (Li & Fukushima, as reviewed by Gill & Runnoe) ---
-            // This is a robust alternative to simple Hessian resetting. We only perform the
-            // BFGS update if the curvature information is deemed reliable, preventing
-            // the Hessian approximation from being corrupted by noisy or poor-quality steps.
+            // Tier 1 (continued): Cautious Update. We only perform the BFGS update if
+            // the curvature information from the successful step is deemed reliable.
             let s_k_norm_sq = s_k.dot(&s_k);
 
-            // The condition is `(y_kᵀs_k) / ||s_k||² ≥ ε ||g_k||^γ`.
-            // We use the recommended parameters ε=1e-6 and γ=1.
+            // The condition is `(y_kᵀs_k) / ||s_k||² ≥ ε ||g_k||^γ`, with parameters
+            // ε=1e-6 and γ=1, as suggested by the literature (Wan et al., 2012).
             let perform_update = if s_k_norm_sq > 1e-16 {
                 let avg_curvature = sy / s_k_norm_sq;
-                let threshold = 1e-6 * g_norm; // Using gamma = 1
+                let threshold = 1e-6 * g_norm;
                 avg_curvature >= threshold
             } else {
-                // Step was too small to provide meaningful curvature; do not update.
+                // The step was too small to provide meaningful curvature; do not update.
                 false
             };
 
             if perform_update {
-                // --- EFFICIENT AND IDIOMATIC O(n²) BFGS INVERSE HESSIAN UPDATE ---
-                // Using ndarray's optimized operations with BLAS backend when available
+                // Curvature is reliable; perform the standard BFGS update.
                 let rho = 1.0 / sy;
-
-                // Compute H_k * y_k (matrix-vector product: O(n²))
                 let h_y = b_inv.dot(&y_k);
-
-                // Compute y_k' * H_k * y_k (scalar: O(n))
                 let y_h_y = y_k.dot(&h_y);
 
-                // Create outer products using ndarray's idiomatic insert_axis + dot technique
-                // This leverages optimized BLAS operations instead of manual loops
                 let s_k_col = s_k.view().insert_axis(Axis(1));
                 let s_k_row = s_k.view().insert_axis(Axis(0));
                 let h_y_col = h_y.view().insert_axis(Axis(1));
                 let h_y_row = h_y.view().insert_axis(Axis(0));
 
-                // Compute rank-1 update matrices using optimized outer products
-                let hy_s_outer = h_y_col.dot(&s_k_row);  // (H_k*y_k) * s_k'
-                let s_hy_outer = s_k_col.dot(&h_y_row);  // s_k * (H_k*y_k)'
-                let s_s_outer = s_k_col.dot(&s_k_row);   // s_k * s_k'
+                let hy_s_outer = h_y_col.dot(&s_k_row);
+                let s_hy_outer = s_k_col.dot(&h_y_row);
+                let s_s_outer = s_k_col.dot(&s_k_row);
 
-                // Apply BFGS update using efficient in-place operations (BLAS axpy)
-                b_inv.scaled_add(-rho, &hy_s_outer);                    // b_inv -= ρ*(H_k*y)*s'
-                b_inv.scaled_add(-rho, &s_hy_outer);                    // b_inv -= ρ*s*(H_k*y)'
-                b_inv.scaled_add(rho * rho * y_h_y + rho, &s_s_outer);  // b_inv += (ρ²*(y'*H_k*y) + ρ)*s*s'
+                b_inv.scaled_add(-rho, &hy_s_outer);
+                b_inv.scaled_add(-rho, &s_hy_outer);
+                b_inv.scaled_add(rho * rho * y_h_y + rho, &s_s_outer);
             }
             // If `perform_update` is false, we "skip" the update by doing nothing,
             // preserving the existing `b_inv`. This is the "cautious" part of the algorithm.
