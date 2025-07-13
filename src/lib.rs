@@ -216,7 +216,7 @@ where
             let mut present_d_k = -b_inv.dot(&g_k);
 
             let (alpha_k, f_next, g_next, f_evals, g_evals) =
-                match line_search(&self.obj_fn, &x_k, present_d_k, f_k, &g_k, self.c1, self.c2) {
+                match line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1, self.c2) {
                     Ok(result) => result,
                     Err(_) => {
                         // Tier 2: Failsafe Hessian Reset. The line search failed, indicating
@@ -229,7 +229,7 @@ where
                         present_d_k = -g_k.clone();
                         // If this second line search also fails, the problem is deemed
                         // intractable, and the error is propagated.
-                        line_search(&self.obj_fn, &x_k, ¤t_d_k, f_k, &g_k, self.c1, self.c2)?
+                        line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1, self.c2)?
                     }
                 };
             func_evals += f_evals;
