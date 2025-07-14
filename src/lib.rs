@@ -69,11 +69,21 @@ enum LineSearchStrategy {
     Backtracking,
 }
 
+enum LineSearchError {
+    MaxAttempts(usize),
+    StepSizeTooSmall,
+}
+
 /// An error type for clear diagnostics.
 #[derive(Debug, thiserror::Error)]
 pub enum BfgsError {
     #[error("The line search failed to find a suitable step after {max_attempts} attempts. The optimization landscape may be pathological.")]
-    LineSearchFailed { max_attempts: usize },
+    LineSearchFailed {
+        /// The best solution found before the line search failed.
+        last_solution: Box<BfgsSolution>,
+        /// The number of attempts the line search made before failing.
+        max_attempts: usize,
+    },
     #[error("Maximum number of iterations ({max_iterations}) reached without converging.")]
     MaxIterationsReached { max_iterations: usize },
     #[error("The gradient norm was NaN or infinity, indicating numerical instability.")]
@@ -183,56 +193,77 @@ where
             if present_d_k.iter().all(|&v| v.abs() < 1e-16) {
                 return Err(BfgsError::StepSizeTooSmall);
             }
-            let mut fallback_triggered = false;
 
             // --- Adaptive Hybrid Line Search Execution ---
             let (alpha_k, f_next, g_next, f_evals, g_evals) = {
                 let search_result = match primary_strategy {
-                    LineSearchStrategy::StrongWolfe => {
-                        line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1, self.c2)
-                    }
-                    LineSearchStrategy::Backtracking => {
-                        backtracking_line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1)
-                    }
+                    LineSearchStrategy::StrongWolfe => line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1, self.c2),
+                    LineSearchStrategy::Backtracking => backtracking_line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1),
                 };
 
                 match search_result {
                     Ok(result) => {
-                        // Success with the primary strategy.
-                        if matches!(primary_strategy, LineSearchStrategy::Backtracking) {
-                            log::debug!("[BFGS Adaptive] Backtracking search succeeded at iter {}. Resetting to Strong Wolfe.", k);
-                            primary_strategy = LineSearchStrategy::StrongWolfe;
-                        }
                         fallback_streak = 0;
                         result
                     }
-                    Err(BfgsError::LineSearchFailed { .. }) => {
-                        // The primary strategy failed, attempt fallback.
-                        fallback_triggered = true;
-                        let fallback_result = if matches!(primary_strategy, LineSearchStrategy::StrongWolfe) {
+                    Err(e) => {
+                        // The primary strategy failed.
+                        if let LineSearchError::StepSizeTooSmall = e {
+                            return Err(BfgsError::StepSizeTooSmall);
+                        }
+
+                        // Attempt fallback if the primary strategy was StrongWolfe.
+                        if matches!(primary_strategy, LineSearchStrategy::StrongWolfe) {
+                            fallback_streak += 1;
                             log::warn!("[BFGS Adaptive] Strong Wolfe failed at iter {}. Falling back to Backtracking.", k);
-                            backtracking_line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1)
+                            let fallback_result = backtracking_line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1);
+                            if let Ok(result) = fallback_result {
+                                // Fallback succeeded.
+                                result
+                            } else {
+                                // The fallback also failed. Terminate with the informative error.
+                                let max_attempts = if let Err(LineSearchError::MaxAttempts(attempts)) = fallback_result { attempts } else { 0 };
+                                let last_solution = Box::new(BfgsSolution {
+                                    final_point: x_k,
+                                    final_value: f_k,
+                                    final_gradient_norm: g_norm,
+                                    iterations: k,
+                                    func_evals,
+                                    grad_evals,
+                                });
+                                return Err(BfgsError::LineSearchFailed { last_solution, max_attempts });
+                            }
                         } else {
                             // The robust Backtracking strategy has failed. This is a critical problem.
                             // Reset the Hessian and try one last time with a steepest descent direction.
                             log::error!("[BFGS Adaptive] CRITICAL: Backtracking failed at iter {}. Resetting Hessian.", k);
                             b_inv = Array2::<f64>::eye(n);
                             present_d_k = -g_k.clone();
-                            backtracking_line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1)
-                        };
-                        fallback_result?
+                            let fallback_result = backtracking_line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1);
+                            if let Ok(result) = fallback_result {
+                                result
+                            } else {
+                                let max_attempts = if let Err(LineSearchError::MaxAttempts(attempts)) = fallback_result { attempts } else { 0 };
+                                let last_solution = Box::new(BfgsSolution {
+                                    final_point: x_k,
+                                    final_value: f_k,
+                                    final_gradient_norm: g_norm,
+                                    iterations: k,
+                                    func_evals,
+                                    grad_evals,
+                                });
+                                return Err(BfgsError::LineSearchFailed { last_solution, max_attempts });
+                            }
+                        }
                     }
-                    Err(e) => return Err(e),
                 }
             };
 
-            if fallback_triggered {
-                fallback_streak += 1;
-                // The "Learner" part: promote Backtracking if Wolfe keeps failing.
-                if fallback_streak >= Self::FALLBACK_THRESHOLD {
-                    log::warn!("[BFGS Adaptive] Fallback streak ({}) reached. Switching primary to Backtracking.", fallback_streak);
-                    primary_strategy = LineSearchStrategy::Backtracking;
-                }
+            // The "Learner" part: promote Backtracking if Wolfe keeps failing.
+            if fallback_streak >= Self::FALLBACK_THRESHOLD {
+                log::warn!("[BFGS Adaptive] Fallback streak ({}) reached. Switching primary to Backtracking.", fallback_streak);
+                primary_strategy = LineSearchStrategy::Backtracking;
+                fallback_streak = 0; // Reset the streak after switching
             }
 
             func_evals += f_evals;
@@ -298,7 +329,7 @@ fn line_search<ObjFn>(
     g_k: &Array1<f64>,
     c1: f64,
     c2: f64,
-) -> Result<(f64, f64, Array1<f64>, usize, usize), BfgsError>
+) -> Result<(f64, f64, Array1<f64>, usize, usize), LineSearchError>
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
 {
@@ -386,7 +417,7 @@ where
         alpha_i *= 2.0;
     }
 
-    Err(BfgsError::LineSearchFailed { max_attempts })
+    Err(LineSearchError::MaxAttempts(max_attempts))
 }
 
 /// A simple backtracking line search that satisfies the Armijo (sufficient decrease) condition.
@@ -397,7 +428,7 @@ fn backtracking_line_search<ObjFn>(
     f_k: f64,
     g_k: &Array1<f64>,
     c1: f64,
-) -> Result<(f64, f64, Array1<f64>, usize, usize), BfgsError>
+) -> Result<(f64, f64, Array1<f64>, usize, usize), LineSearchError>
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
 {
@@ -426,11 +457,11 @@ where
         alpha *= rho;
         // Prevent pathologically small steps from causing an infinite loop.
         if alpha < 1e-16 {
-            return Err(BfgsError::StepSizeTooSmall);
+            return Err(LineSearchError::StepSizeTooSmall);
         }
     }
 
-    Err(BfgsError::LineSearchFailed { max_attempts })
+    Err(LineSearchError::MaxAttempts(max_attempts))
 }
 
 
@@ -456,7 +487,7 @@ fn zoom<ObjFn>(
     mut g_hi_dot_d: f64,
     mut func_evals: usize,
     mut grad_evals: usize,
-) -> Result<(f64, f64, Array1<f64>, usize, usize), BfgsError>
+) -> Result<(f64, f64, Array1<f64>, usize, usize), LineSearchError>
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
 {
@@ -468,7 +499,7 @@ where
         // If the entire bracket is in an unusable (infinite) region, fail immediately.
         if !f_lo.is_finite() && !f_hi.is_finite() {
             log::warn!("[BFGS Zoom] Line search bracketed an infinite region. Aborting.");
-            return Err(BfgsError::LineSearchFailed { max_attempts: max_zoom_attempts });
+            return Err(LineSearchError::MaxAttempts(max_zoom_attempts));
         }
         let alpha_j = {
             // Ensure alpha_lo < alpha_hi for stable interpolation.
@@ -524,9 +555,7 @@ where
         // A NaN value indicates a fatal numerical error (e.g., domain error)
         // from which the optimizer cannot recover.
         if f_j.is_nan() || g_j.iter().any(|&v| v.is_nan()) {
-            return Err(BfgsError::LineSearchFailed {
-                max_attempts: max_zoom_attempts,
-            });
+            return Err(LineSearchError::MaxAttempts(max_zoom_attempts));
         }
 
         // Check if the new point `alpha_j` satisfies the sufficient decrease condition.
@@ -561,9 +590,7 @@ where
             }
         }
     }
-    Err(BfgsError::LineSearchFailed {
-        max_attempts: max_zoom_attempts,
-    })
+    Err(LineSearchError::MaxAttempts(max_zoom_attempts))
 }
 
 
