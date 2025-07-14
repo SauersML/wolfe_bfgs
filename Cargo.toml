@@ -1,6 +1,6 @@
 [package]
 name = "wolfe_bfgs"
-version = "0.1.3"
+version = "0.1.4"
 authors = ["Paul Kernfeld <paulkernfeld@gmail.com>", "SauersML"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
