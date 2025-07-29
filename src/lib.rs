@@ -84,8 +84,11 @@ pub enum BfgsError {
         /// The number of attempts the line search made before failing.
         max_attempts: usize,
     },
-    #[error("Maximum number of iterations ({max_iterations}) reached without converging.")]
-    MaxIterationsReached { max_iterations: usize },
+    #[error("Maximum number of iterations reached without converging. The best solution found is returned.")]
+    MaxIterationsReached {
+        /// The best solution found before the iteration limit was reached.
+        last_solution: Box<BfgsSolution>,
+    },
     #[error("The gradient norm was NaN or infinity, indicating numerical instability.")]
     GradientIsNaN,
     #[error("The line search step size became smaller than machine epsilon, indicating that the algorithm is stuck.")]
@@ -313,7 +316,19 @@ where
             g_k = g_next;
         }
 
-        Err(BfgsError::MaxIterationsReached { max_iterations: self.max_iterations })
+        // The loop finished. Construct a solution from the final state.
+        let final_g_norm = g_k.dot(&g_k).sqrt();
+        let last_solution = Box::new(BfgsSolution {
+            final_point: x_k,
+            final_value: f_k,
+            final_gradient_norm: final_g_norm,
+            iterations: self.max_iterations,
+            func_evals,
+            grad_evals,
+        });
+
+        // Return the new error variant containing the solution.
+        Err(BfgsError::MaxIterationsReached { last_solution })
     }
 }
 
@@ -749,11 +764,20 @@ mod tests {
     #[test]
     fn test_max_iterations_error_is_returned() {
         let x0 = array![-1.2, 1.0];
-        let result = Bfgs::new(x0, rosenbrock).with_max_iterations(5).run();
-        assert!(matches!(
-            result,
-            Err(BfgsError::MaxIterationsReached { .. })
-        ));
+        let max_iterations = 5;
+        let result = Bfgs::new(x0, rosenbrock)
+            .with_max_iterations(max_iterations)
+            .run();
+
+        match result {
+            Err(BfgsError::MaxIterationsReached { last_solution }) => {
+                assert_eq!(last_solution.iterations, max_iterations);
+                // Also check that the point is not the origin, i.e., that some work was done.
+                assert_that!(&last_solution.final_point.dot(&last_solution.final_point))
+                    .is_greater_than(0.0);
+            }
+            _ => panic!("Expected MaxIterationsReached error, but got {:?}", result),
+        }
     }
 
     #[test]
