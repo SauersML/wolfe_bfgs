@@ -1,4 +1,5 @@
 //! An implementation of the BFGS optimization algorithm.
+#![allow(non_snake_case)]
 //!
 //! This crate provides a solver for unconstrained nonlinear optimization problems,
 //! built upon the principles outlined in "Numerical Optimization" by Nocedal & Wright.
@@ -61,6 +62,75 @@
 
 use log;
 use ndarray::{Array1, Array2, Axis};
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+
+// Numerical helpers and small utilities
+const EPS: f64 = std::f64::EPSILON;
+#[inline]
+fn eps_f(fk: f64, tau: f64) -> f64 { tau * EPS * (1.0 + fk.abs()) }
+#[inline]
+fn eps_g(gk: &Array1<f64>, dk: &Array1<f64>, tau: f64) -> f64 {
+    tau * EPS * gk.dot(gk).sqrt() * dk.dot(dk).sqrt()
+}
+// removed unused step_small helper
+
+// Ring buffer for GLL nonmonotone Armijo (internal only)
+struct GllWindow { buf: VecDeque<f64>, cap: usize }
+impl GllWindow {
+    fn new(cap: usize) -> Self { Self { buf: VecDeque::with_capacity(cap), cap } }
+    fn clear(&mut self) { self.buf.clear(); }
+    fn push(&mut self, f: f64) { if self.buf.len() == self.cap { self.buf.pop_front(); } self.buf.push_back(f); }
+    fn fmax(&self) -> f64 { self.buf.iter().cloned().fold(f64::NEG_INFINITY, f64::max) }
+    fn is_empty(&self) -> bool { self.buf.is_empty() }
+}
+
+// Best-seen tracker during line search/zoom (internal only)
+#[derive(Clone)]
+struct ProbeBest { f: f64, x: Array1<f64>, g: Array1<f64> }
+impl ProbeBest {
+    fn new(x0: &Array1<f64>, f0: f64, g0: &Array1<f64>) -> Self { Self { x: x0.clone(), f: f0, g: g0.clone() } }
+    fn consider(&mut self, x: &Array1<f64>, f: f64, g: &Array1<f64>) { if f < self.f { self.f = f; self.x = x.clone(); self.g = g.clone(); } }
+}
+
+// Simple dense SPD Cholesky (LL^T) and solve utilities
+fn chol_decompose(a: &Array2<f64>) -> Option<Array2<f64>> {
+    let n = a.nrows();
+    if a.ncols() != n { return None; }
+    let mut l = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = a[[i, j]];
+            for k in 0..j { sum -= l[[i, k]] * l[[j, k]]; }
+            if i == j {
+                if sum <= 0.0 || !sum.is_finite() { return None; }
+                l[[i, j]] = sum.sqrt();
+            } else {
+                l[[i, j]] = sum / l[[j, j]];
+            }
+        }
+    }
+    Some(l)
+}
+
+fn chol_solve(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
+    let n = l.nrows();
+    // Forward solve: L y = b
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let mut sum = b[i];
+        for k in 0..i { sum -= l[[i,k]] * y[k]; }
+        y[i] = sum / l[[i,i]];
+    }
+    // Backward solve: L^T x = y
+    let mut x = Array1::<f64>::zeros(n);
+    for i in (0..n).rev() {
+        let mut sum = y[i];
+        for k in (i+1)..n { sum -= l[[k,i]] * x[k]; }
+        x[i] = sum / l[[i,i]];
+    }
+    x
+}
 
 // An enum to manage the adaptive strategy.
 #[derive(Debug, Clone, Copy)]
@@ -126,6 +196,24 @@ where
     max_iterations: usize,
     c1: f64,
     c2: f64,
+    // --- Private adaptive state (no API change) ---
+    gll: RefCell<GllWindow>,
+    c1_adapt: Cell<f64>,
+    c2_adapt: Cell<f64>,
+    wolfe_fail_streak: Cell<usize>,
+    primary_strategy: Cell<LineSearchStrategy>,
+    trust_radius: Cell<f64>,
+    global_best: RefCell<Option<ProbeBest>>,
+    // Diagnostics counters
+    approx_wolfe_accepts: Cell<usize>,
+    tr_fallbacks: Cell<usize>,
+    strategy_switches: Cell<usize>,
+    resets_count: Cell<usize>,
+    stay_nonmonotone: Cell<usize>,
+    nonfinite_seen: Cell<bool>,
+    wolfe_clean_successes: Cell<usize>,
+    bt_clean_successes: Cell<usize>,
+    ls_failures_in_row: Cell<usize>,
 }
 
 impl<ObjFn> Bfgs<ObjFn>
@@ -147,7 +235,89 @@ where
             max_iterations: 100,
             c1: 1e-4, // Standard value for sufficient decrease
             c2: 0.9,  // Standard value for curvature condition
+            gll: RefCell::new(GllWindow::new(8)),
+            c1_adapt: Cell::new(1e-4),
+            c2_adapt: Cell::new(0.9),
+            wolfe_fail_streak: Cell::new(0),
+            primary_strategy: Cell::new(LineSearchStrategy::StrongWolfe),
+            trust_radius: Cell::new(1.0),
+            global_best: RefCell::new(None),
+            approx_wolfe_accepts: Cell::new(0),
+            tr_fallbacks: Cell::new(0),
+            strategy_switches: Cell::new(0),
+            resets_count: Cell::new(0),
+            stay_nonmonotone: Cell::new(0),
+            nonfinite_seen: Cell::new(false),
+            wolfe_clean_successes: Cell::new(0),
+            bt_clean_successes: Cell::new(0),
+            ls_failures_in_row: Cell::new(0),
         }
+    }
+
+    #[inline]
+    fn accept_nonmonotone(&self, f_k: f64, fmax: f64, alpha: f64, gkdotd: f64, f_i: f64) -> bool {
+        let c1 = self.c1_adapt.get();
+        let epsf = eps_f(f_k, 1e3);
+        (f_i <= f_k + c1 * alpha * gkdotd + epsf) || (f_i <= fmax + c1 * alpha * gkdotd + epsf)
+    }
+
+fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) -> Option<(Array1<f64>, f64)> {
+        // Factor B_inv = L L^T (SPD). If it fails, add a small ridge and retry once.
+        let mut binv = b_inv.clone();
+        let l = match chol_decompose(&binv) {
+            Some(L) => L,
+            None => {
+                let n = binv.nrows();
+                let mean_diag = (0..n).map(|i| binv[[i,i]].abs()).sum::<f64>()/(n as f64);
+                let ridge = (1e-10*mean_diag).max(1e-16);
+                for i in 0..binv.nrows() { binv[[i,i]] += ridge; }
+                match chol_decompose(&binv) {
+                    Some(L2) => L2,
+                    None => return None,
+                }
+            }
+        };
+        // z = H g solves B_inv z = g
+        let z = chol_solve(&l, g);
+        let gnorm2 = g.dot(g);
+        let gHg = g.dot(&z).max(1e-16);
+        // Cauchy step
+        let tau = gnorm2 / gHg;
+        let p_u = -&(g * tau);
+        // Newton/BFGS step
+        let p_b = -binv.dot(g);
+        let p_b_norm = p_b.dot(&p_b).sqrt();
+        if p_b_norm <= delta {
+            // predicted decrease: m(p) = g^T p + 0.5 p^T H p, with H p via solve
+            let hpb = chol_solve(&l, &p_b);
+            let pred = g.dot(&p_b) + 0.5 * p_b.dot(&hpb);
+            let pred_dec = -pred;
+            if !pred_dec.is_finite() || pred_dec <= 0.0 { return None; }
+            return Some((p_b, pred_dec));
+        }
+        let p_u_norm = p_u.dot(&p_u).sqrt();
+        if p_u_norm >= delta {
+            let p = -g * (delta / gnorm2.sqrt());
+            let hp = chol_solve(&l, &p);
+            let pred = g.dot(&p) + 0.5 * p.dot(&hp);
+            let pred_dec = -pred;
+            if !pred_dec.is_finite() || pred_dec <= 0.0 { return None; }
+            return Some((p, pred_dec));
+        }
+        // Dogleg along segment from pu to pb hitting boundary
+        let s = &p_b - &p_u;
+        let a = s.dot(&s);
+        let b = 2.0 * p_u.dot(&s);
+        let c = p_u.dot(&p_u) - delta * delta;
+        let disc = b*b - 4.0*a*c;
+        if !disc.is_finite() || disc < 0.0 { return None; }
+        let t = (-b + disc.sqrt()) / (2.0 * a);
+        let p = &p_u + &(s * t);
+        let hp = chol_solve(&l, &p);
+        let pred = g.dot(&p) + 0.5 * p.dot(&hp);
+        let pred_dec = -pred;
+        if !pred_dec.is_finite() || pred_dec <= 0.0 { return None; }
+        Some((p, pred_dec))
     }
 
     /// Sets the convergence tolerance (default: 1e-5).
@@ -172,69 +342,206 @@ where
 
         let mut b_inv = Array2::<f64>::eye(n);
 
-        // --- State for the Adaptive Strategy ---
-        let mut primary_strategy = LineSearchStrategy::StrongWolfe;
-        let mut fallback_streak = 0;
+        // Initialize adaptive state
+        {
+            let mut gll = self.gll.borrow_mut();
+            gll.clear();
+            gll.push(f_k);
+        }
+        self.global_best.borrow_mut().replace(ProbeBest::new(&x_k, f_k, &g_k));
+        self.c1_adapt.set(self.c1);
+        self.c2_adapt.set(self.c2);
+        self.primary_strategy.set(LineSearchStrategy::StrongWolfe);
+        self.wolfe_fail_streak.set(0);
+        self.stay_nonmonotone.set(0);
+        // Initialize trust radius relative to starting point scale
+        let xnorm0 = x_k.dot(&x_k).sqrt();
+        self.trust_radius.set((1.0 + xnorm0).min(1e6));
 
+        let mut stall_count: usize = 0;
         for k in 0..self.max_iterations {
+            // reset non-finite flag per iteration
+            self.nonfinite_seen.set(false);
             let g_norm = g_k.dot(&g_k).sqrt();
             if !g_norm.is_finite() {
+                log::warn!("[BFGS] Non-finite gradient norm at iter {}: g_norm={:?}", k, g_norm);
                 return Err(BfgsError::GradientIsNaN);
             }
             if g_norm < self.tolerance {
-                return Ok(BfgsSolution {
+                let sol = BfgsSolution {
                     final_point: x_k,
                     final_value: f_k,
                     final_gradient_norm: g_norm,
                     iterations: k,
                     func_evals,
                     grad_evals,
-                });
+                };
+                log::info!(
+                    "[BFGS] Converged by gradient: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
+                    k, sol.final_value, sol.final_gradient_norm, sol.func_evals, sol.grad_evals, self.trust_radius.get()
+                );
+                return Ok(sol);
             }
 
             let mut present_d_k = -b_inv.dot(&g_k);
-            if present_d_k.iter().all(|&v| v.abs() < 1e-16) {
-                return Err(BfgsError::StepSizeTooSmall);
+            // Enforce descent direction; reset if needed
+            let gdotd = g_k.dot(&present_d_k);
+            if gdotd >= 0.0 || present_d_k.iter().all(|&v| v.abs() < 1e-16) {
+                log::warn!("[BFGS] Non-descent direction; resetting to -g and B_inv=I.");
+                b_inv = Array2::eye(n);
+                present_d_k = -g_k.clone();
+                self.resets_count.set(self.resets_count.get() + 1);
             }
 
             // --- Adaptive Hybrid Line Search Execution ---
             let (alpha_k, f_next, g_next, f_evals, g_evals) = {
-                let search_result = match primary_strategy {
-                    LineSearchStrategy::StrongWolfe => line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1, self.c2),
-                    LineSearchStrategy::Backtracking => backtracking_line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1),
+                let search_result = match self.primary_strategy.get() {
+                    LineSearchStrategy::StrongWolfe => line_search(self, &self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1_adapt.get(), self.c2_adapt.get()),
+                    LineSearchStrategy::Backtracking => backtracking_line_search(self, &self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1_adapt.get()),
                 };
 
                 match search_result {
                     Ok(result) => {
-                        fallback_streak = 0;
+                        // Reset failure streak and relax toward canonical constants
+                        self.wolfe_fail_streak.set(0);
+                        self.ls_failures_in_row.set(0);
+                        self.c1_adapt.set((self.c1_adapt.get()*0.9).max(1e-4));
+                        self.c2_adapt.set((self.c2_adapt.get()*1.1).min(0.9));
+                        match self.primary_strategy.get() {
+                            LineSearchStrategy::StrongWolfe => {
+                                self.wolfe_clean_successes.set(self.wolfe_clean_successes.get()+1);
+                                self.bt_clean_successes.set(0);
+                            }
+                            LineSearchStrategy::Backtracking => {
+                                self.bt_clean_successes.set(self.bt_clean_successes.get()+1);
+                                self.wolfe_clean_successes.set(0);
+                            }
+                        }
                         result
                     }
                     Err(e) => {
                         // The primary strategy failed.
                         if let LineSearchError::StepSizeTooSmall = e {
-                            return Err(BfgsError::StepSizeTooSmall);
+                            // Treat as search failure; shrink trust radius and try fallback paths
+                            self.trust_radius.set((self.trust_radius.get()*0.5).max(1e-12));
                         }
 
                         // Attempt fallback if the primary strategy was StrongWolfe.
-                        if matches!(primary_strategy, LineSearchStrategy::StrongWolfe) {
-                            fallback_streak += 1;
+                        if matches!(self.primary_strategy.get(), LineSearchStrategy::StrongWolfe) {
+                            let streak = self.wolfe_fail_streak.get() + 1;
+                            self.wolfe_fail_streak.set(streak);
                             log::warn!("[BFGS Adaptive] Strong Wolfe failed at iter {}. Falling back to Backtracking.", k);
-                            let fallback_result = backtracking_line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1);
+                            // Adapt c1/c2 on failures
+                            if streak == 1 { self.c2_adapt.set(0.5); }
+                            if streak >= 2 { self.c2_adapt.set(0.1); self.c1_adapt.set(1e-3); }
+                            self.ls_failures_in_row.set(self.ls_failures_in_row.get()+1);
+                            if self.ls_failures_in_row.get() >= 2 {
+                                self.gll.borrow_mut().cap = 10;
+                            }
+                            let fallback_result = backtracking_line_search(self, &self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1_adapt.get());
                             if let Ok(result) = fallback_result {
                                 // Fallback succeeded.
                                 result
                             } else {
                                 // The fallback also failed. Terminate with the informative error.
                                 let max_attempts = if let Err(LineSearchError::MaxAttempts(attempts)) = fallback_result { attempts } else { 0 };
-                                let last_solution = Box::new(BfgsSolution {
-                                    final_point: x_k,
-                                    final_value: f_k,
-                                    final_gradient_norm: g_norm,
-                                    iterations: k,
-                                    func_evals,
-                                    grad_evals,
-                                });
-                                return Err(BfgsError::LineSearchFailed { last_solution, max_attempts });
+                                // Salvage best point seen during line search if any
+                                if let Some(b) = self.global_best.borrow().as_ref() {
+                                    if b.f < f_k - eps_f(f_k, 1e3) {
+                                        x_k = b.x.clone(); f_k = b.f; g_k = b.g.clone();
+                                        b_inv = Array2::eye(n);
+                                        continue;
+                                    }
+                                }
+                                // Try full trust-region dogleg fallback before giving up
+                                let delta = self.trust_radius.get();
+                                if let Some((p_tr, pred_dec)) = self.trust_region_dogleg(&b_inv, &g_k, delta) {
+                                    let x_try = &x_k + &p_tr;
+                                    let g_old = g_k.clone();
+                                    let (f_try, g_try) = (self.obj_fn)(&x_try);
+                                    func_evals += 1; grad_evals += 1;
+                                    let act_dec = f_k - f_try;
+                                    if !pred_dec.is_finite() || pred_dec <= 0.0 { self.trust_radius.set((delta*0.5).max(1e-12)); } else {
+                                        let rho = act_dec / pred_dec;
+                                        self.tr_fallbacks.set(self.tr_fallbacks.get() + 1);
+                                        if rho > 0.1 && f_try.is_finite() && g_try.iter().all(|v| v.is_finite()) {
+                                            x_k = x_try; f_k = f_try; g_k = g_try.clone();
+                                            // Update GLL window and global best
+                                            self.gll.borrow_mut().push(f_k);
+                                        let maybe_f = { let gb = self.global_best.borrow(); gb.as_ref().map(|b| b.f) };
+                                        if let Some(bf) = maybe_f {
+                                            if f_k < bf - eps_f(bf, 100.0) {
+                                                self.global_best.borrow_mut().replace(ProbeBest { f: f_k, x: x_k.clone(), g: g_k.clone() });
+                                            }
+                                        } else {
+                                            self.global_best.borrow_mut().replace(ProbeBest::new(&x_k, f_k, &g_k));
+                                        }
+                                            if rho > 0.75 && p_tr.dot(&p_tr).sqrt() > 0.99*delta { self.trust_radius.set((delta*2.0).min(1e6)); }
+                                            else if rho < 0.25 { self.trust_radius.set((delta*0.5).max(1e-12)); }
+                                            // Also update B_inv using TR step (Powell-damped)
+                                            let s_tr = p_tr.clone();
+                                            let y_tr = &g_try - &g_old;
+                                            let s_norm_tr = s_tr.dot(&s_tr).sqrt();
+                                            if s_norm_tr > 1e-14 {
+                                                let mut binv_upd = b_inv.clone();
+                                                let mut Lopt = chol_decompose(&binv_upd);
+                                                if Lopt.is_none() {
+                                                    let mean_diag = (0..n).map(|i| binv_upd[[i,i]].abs()).sum::<f64>()/(n as f64);
+                                                    let ridge = (1e-10*mean_diag).max(1e-16);
+                                                    for i in 0..n { binv_upd[[i,i]] += ridge; }
+                                                    Lopt = chol_decompose(&binv_upd);
+                                                }
+                                                if let Some(L) = Lopt {
+                                                    let h_s = chol_solve(&L, &s_tr);
+                                                    let s_h_s = s_tr.dot(&h_s);
+                                                    let sy_tr = s_tr.dot(&y_tr);
+                                                    let theta = if sy_tr < 0.2 * s_h_s { 0.8 * s_h_s / (s_h_s - sy_tr) } else { 1.0 };
+                                                    let y_tilde = &y_tr * theta + &h_s * (1.0 - theta);
+                                                    let sty = s_tr.dot(&y_tilde);
+                                                    if sty.is_finite() && sty > 1e-16 * s_norm_tr * y_tilde.dot(&y_tilde).sqrt() {
+                                                        let rho_up = 1.0 / sty;
+                                                        let s_col = s_tr.view().insert_axis(Axis(1));
+                                                        let s_row = s_tr.view().insert_axis(Axis(0));
+                                                        let y_col = y_tilde.view().insert_axis(Axis(1));
+                                                        let y_row = y_tilde.view().insert_axis(Axis(0));
+                                                        let eye = Array2::<f64>::eye(n);
+                                                        let left  = &eye - &(rho_up * s_col.dot(&y_row));
+                                                        let right = &eye - &(rho_up * y_col.dot(&s_row));
+                                                        let s_s_t = s_col.dot(&s_row);
+                                                        let tmp = left.dot(&b_inv).dot(&right);
+                                                        b_inv = tmp + rho_up * s_s_t;
+                                                        b_inv = (&b_inv + &b_inv.t()) * 0.5;
+                                                    } else {
+                                                        for i in 0..n { b_inv[[i,i]] += 1e-10; }
+                                                    }
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                                // Shrink trust radius; if non-finite seen, return error; else continue
+                                self.trust_radius.set((self.trust_radius.get()*0.5).max(1e-12));
+                                if self.nonfinite_seen.get() {
+                                    let mut ls = BfgsSolution {
+                                        final_point: x_k.clone(),
+                                        final_value: f_k,
+                                        final_gradient_norm: g_norm,
+                                        iterations: k,
+                                        func_evals,
+                                        grad_evals,
+                                    };
+                                    if let Some(b) = self.global_best.borrow().as_ref() {
+                                        if b.f < f_k - eps_f(f_k, 1e3) {
+                                            ls.final_point = b.x.clone();
+                                            ls.final_value = b.f;
+                                            ls.final_gradient_norm = b.g.dot(&b.g).sqrt();
+                                        }
+                                    }
+                                    log::warn!("[BFGS] Line search failed at iter {} (nonfinite seen), fe={}, ge={}, Δ={:.3e}", k, func_evals, grad_evals, self.trust_radius.get());
+                                    return Err(BfgsError::LineSearchFailed { last_solution: Box::new(ls), max_attempts });
+                                }
+                                continue;
                             }
                         } else {
                             // The robust Backtracking strategy has failed. This is a critical problem.
@@ -242,20 +549,66 @@ where
                             log::error!("[BFGS Adaptive] CRITICAL: Backtracking failed at iter {}. Resetting Hessian.", k);
                             b_inv = Array2::<f64>::eye(n);
                             present_d_k = -g_k.clone();
-                            let fallback_result = backtracking_line_search(&self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1);
+                            let fallback_result = backtracking_line_search(self, &self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1_adapt.get());
                             if let Ok(result) = fallback_result {
                                 result
                             } else {
                                 let max_attempts = if let Err(LineSearchError::MaxAttempts(attempts)) = fallback_result { attempts } else { 0 };
-                                let last_solution = Box::new(BfgsSolution {
-                                    final_point: x_k,
-                                    final_value: f_k,
-                                    final_gradient_norm: g_norm,
-                                    iterations: k,
-                                    func_evals,
-                                    grad_evals,
-                                });
-                                return Err(BfgsError::LineSearchFailed { last_solution, max_attempts });
+                                // Full trust-region dogleg fallback
+                                let delta = self.trust_radius.get();
+                                if let Some((p_tr, pred_dec)) = self.trust_region_dogleg(&b_inv, &g_k, delta) {
+                                    let x_try = &x_k + &p_tr;
+                                    let (f_try, g_try) = (self.obj_fn)(&x_try);
+                                    func_evals += 1; grad_evals += 1;
+                                    let act_dec = f_k - f_try;
+                                    if !pred_dec.is_finite() || pred_dec <= 0.0 { self.trust_radius.set((delta*0.5).max(1e-12)); } else {
+                                        let rho = act_dec / pred_dec;
+                                        self.tr_fallbacks.set(self.tr_fallbacks.get() + 1);
+                                        if rho > 0.1 && f_try.is_finite() && g_try.iter().all(|v| v.is_finite()) {
+                                        x_k = x_try; f_k = f_try; g_k = g_try;
+                                        // Update GLL window and global best
+                                        self.gll.borrow_mut().push(f_k);
+                                        let maybe_f = { let gb = self.global_best.borrow(); gb.as_ref().map(|b| b.f) };
+                                        if let Some(bf) = maybe_f {
+                                            if f_k < bf - eps_f(bf, 100.0) {
+                                                self.global_best.borrow_mut().replace(ProbeBest { f: f_k, x: x_k.clone(), g: g_k.clone() });
+                                            }
+                                        } else {
+                                            self.global_best.borrow_mut().replace(ProbeBest::new(&x_k, f_k, &g_k));
+                                        }
+                                            if rho > 0.75 && p_tr.dot(&p_tr).sqrt() > 0.99*delta { self.trust_radius.set((delta*2.0).min(1e6)); }
+                                            else if rho < 0.25 { self.trust_radius.set((delta*0.5).max(1e-12)); }
+                                            continue;
+                                        } else {
+                                            self.trust_radius.set((delta*0.5).max(1e-12));
+                                        }
+                                    }
+                                }
+                                if let Some(b) = self.global_best.borrow().as_ref() {
+                                    if b.f < f_k - eps_f(f_k, 1e3) { x_k = b.x.clone(); f_k = b.f; g_k = b.g.clone(); b_inv = Array2::eye(n); continue; }
+                                }
+                                // Shrink trust radius; if non-finite seen, return error; else continue
+                                self.trust_radius.set((self.trust_radius.get()*0.5).max(1e-12));
+                                if self.nonfinite_seen.get() {
+                                    let mut ls = BfgsSolution {
+                                        final_point: x_k.clone(),
+                                        final_value: f_k,
+                                        final_gradient_norm: g_norm,
+                                        iterations: k,
+                                        func_evals,
+                                        grad_evals,
+                                    };
+                                    if let Some(b) = self.global_best.borrow().as_ref() {
+                                        if b.f < f_k - eps_f(f_k, 1e3) {
+                                            ls.final_point = b.x.clone();
+                                            ls.final_value = b.f;
+                                            ls.final_gradient_norm = b.g.dot(&b.g).sqrt();
+                                        }
+                                    }
+                                    log::warn!("[BFGS] Line search failed at iter {} (nonfinite seen), fe={}, ge={}, Δ={:.3e}", k, func_evals, grad_evals, self.trust_radius.get());
+                                    return Err(BfgsError::LineSearchFailed { last_solution: Box::new(ls), max_attempts });
+                                }
+                                continue;
                             }
                         }
                     }
@@ -263,10 +616,29 @@ where
             };
 
             // The "Learner" part: promote Backtracking if Wolfe keeps failing.
-            if fallback_streak >= Self::FALLBACK_THRESHOLD {
-                log::warn!("[BFGS Adaptive] Fallback streak ({}) reached. Switching primary to Backtracking.", fallback_streak);
-                primary_strategy = LineSearchStrategy::Backtracking;
-                fallback_streak = 0; // Reset the streak after switching
+            if self.wolfe_fail_streak.get() >= Self::FALLBACK_THRESHOLD {
+                log::warn!("[BFGS Adaptive] Fallback streak ({}) reached. Switching primary to Backtracking.", self.wolfe_fail_streak.get());
+                self.primary_strategy.set(LineSearchStrategy::Backtracking);
+                self.strategy_switches.set(self.strategy_switches.get() + 1);
+                self.wolfe_fail_streak.set(0);
+                self.stay_nonmonotone.set(10);
+            }
+            // Switch back to StrongWolfe after a run of clean backtracking successes
+            if matches!(self.primary_strategy.get(), LineSearchStrategy::Backtracking)
+                && self.bt_clean_successes.get() >= 3 && self.wolfe_fail_streak.get()==0 {
+                log::info!("[BFGS Adaptive] Backtracking succeeded cleanly ({} iters); switching back to StrongWolfe.", self.bt_clean_successes.get());
+                self.primary_strategy.set(LineSearchStrategy::StrongWolfe);
+                self.strategy_switches.set(self.strategy_switches.get() + 1);
+                self.bt_clean_successes.set(0);
+                self.gll.borrow_mut().cap = 8;
+            }
+            // Switch back to StrongWolfe after a run of clean backtracking successes
+            if matches!(self.primary_strategy.get(), LineSearchStrategy::Backtracking)
+                && self.bt_clean_successes.get() >= 5 && self.wolfe_fail_streak.get()==0 {
+                log::info!("[BFGS Adaptive] Backtracking succeeded cleanly ({} iters); switching back to StrongWolfe.", self.bt_clean_successes.get());
+                self.primary_strategy.set(LineSearchStrategy::StrongWolfe);
+                self.strategy_switches.set(self.strategy_switches.get() + 1);
+                self.bt_clean_successes.set(0);
             }
 
             func_evals += f_evals;
@@ -279,41 +651,126 @@ where
             let sy = s_k.dot(&y_k);
 
             if k == 0 {
-                // For the very first step, apply the scaling heuristic.
+                // Improved first-step scaling
                 let yy = y_k.dot(&y_k);
-                if sy > 1e-10 && yy > 0.0 {
-                    b_inv = Array2::eye(n) * (sy / yy);
-                }
+                let mut scale = if sy > 1e-12 && yy > 0.0 { sy / yy } else { 1.0 };
+                if !scale.is_finite() { scale = 1.0; }
+                scale = scale.clamp(1e-3, 1e3);
+                b_inv = Array2::eye(n) * scale;
             } else {
-                // For all subsequent steps, perform the standard BFGS update.
+                // Powell-damped inverse BFGS update (keep SPD)
                 let s_norm = s_k.dot(&s_k).sqrt();
-                let y_norm = y_k.dot(&y_k).sqrt();
-
-                if sy > f64::EPSILON * s_norm * y_norm {
-                    let rho = 1.0 / sy;
-                    let h_y = b_inv.dot(&y_k);
-                    let y_h_y = y_k.dot(&h_y);
-                    let s_k_col = s_k.view().insert_axis(Axis(1));
-                    let s_k_row = s_k.view().insert_axis(Axis(0));
-                    let h_y_col = h_y.view().insert_axis(Axis(1));
-                    let h_y_row = h_y.view().insert_axis(Axis(0));
-                    let hy_s_outer = h_y_col.dot(&s_k_row);
-                    let s_hy_outer = s_k_col.dot(&h_y_row);
-                    let s_s_outer = s_k_col.dot(&s_k_row);
-                    b_inv.scaled_add(-rho, &hy_s_outer);
-                    b_inv.scaled_add(-rho, &s_hy_outer);
-                    b_inv.scaled_add(rho * rho * y_h_y + rho, &s_s_outer);
-
-                    // Enforce symmetry to counteract floating-point drift.
+                if s_norm > 1e-14 {
+                    // Compute H s via solving B_inv * (H s) = s
+                    let mut binv_upd = b_inv.clone();
+                    let mut Lopt = chol_decompose(&binv_upd);
+                    if Lopt.is_none() {
+                        // scale-aware ridge
+                        let mean_diag = (0..n).map(|i| binv_upd[[i,i]].abs()).sum::<f64>()/(n as f64);
+                        let ridge = (1e-10*mean_diag).max(1e-16);
+                        for i in 0..n { binv_upd[[i,i]] += ridge; }
+                        Lopt = chol_decompose(&binv_upd);
+                    }
+                    if let Some(L) = Lopt {
+                        let h_s = chol_solve(&L, &s_k);
+                        let s_h_s = s_k.dot(&h_s);
+                        let theta = if sy < 0.2 * s_h_s { 0.8 * s_h_s / (s_h_s - sy) } else { 1.0 };
+                        let y_tilde = &y_k * theta + &h_s * (1.0 - theta);
+                        let sty = s_k.dot(&y_tilde);
+                        if !sty.is_finite() || sty <= 1e-16 * s_norm * y_tilde.dot(&y_tilde).sqrt() {
+                            log::warn!("[BFGS] s^T y_tilde non-positive/tiny; skipping update and inflating diag.");
+                            for i in 0..n { b_inv[[i,i]] *= 1.0 + 1e-3; }
+                        } else {
+                            let rho = 1.0 / sty;
+                            let s_col = s_k.view().insert_axis(Axis(1));
+                            let s_row = s_k.view().insert_axis(Axis(0));
+                            let y_col = y_tilde.view().insert_axis(Axis(1));
+                            let y_row = y_tilde.view().insert_axis(Axis(0));
+                            let eye = Array2::<f64>::eye(n);
+                            let left  = &eye - &(rho * s_col.dot(&y_row));
+                            let right = &eye - &(rho * y_col.dot(&s_row));
+                            let s_s_t = s_col.dot(&s_row);
+                            let tmp = left.dot(&b_inv).dot(&right);
+                            b_inv = tmp + rho * s_s_t;
+                        }
+                    } else {
+                        log::warn!("[BFGS] B_inv not SPD after ridge; skipping update this iter.");
+                    }
+                    // Enforce symmetry and gentle regularization
                     b_inv = (&b_inv + &b_inv.t()) * 0.5;
-                } else {
-                    log::debug!("[BFGS] Curvature condition failed (sy / (||s||*||y||) is too small). Skipping Hessian update.");
+                    let mut diag_min = f64::INFINITY;
+                    for i in 0..n { diag_min = diag_min.min(b_inv[[i,i]]); }
+                    if !diag_min.is_finite() || diag_min <= 0.0 {
+                        let fro = b_inv.mapv(|v| v*v).sum().sqrt();
+                        let delta = 1e-12 * fro;
+                        for i in 0..n { b_inv[[i,i]] += delta; }
+                    }
                 }
+            }
+
+            // Optional richer stopping tests: small step and flat f
+            let step_ok = s_k.dot(&s_k).sqrt() <= 1e-12 * (1.0 + x_k.dot(&x_k).sqrt()) + 1e-16;
+            let f_ok = (f_next - f_k).abs() <= eps_f(f_k, 1e3);
+            let gnext_finite = f_next.is_finite() && g_next.iter().all(|v| v.is_finite());
+            let gnext_norm = g_next.dot(&g_next).sqrt();
+            if step_ok && f_ok && gnext_finite && gnext_norm < self.tolerance {
+                let sol = BfgsSolution {
+                    final_point: x_k.clone() + &s_k,
+                    final_value: f_next,
+                    final_gradient_norm: gnext_norm,
+                    iterations: k + 1,
+                    func_evals,
+                    grad_evals,
+                };
+                log::info!(
+                    "[BFGS] Converged by small step/flat f: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
+                    sol.iterations, sol.final_value, sol.final_gradient_norm, sol.func_evals, sol.grad_evals, self.trust_radius.get()
+                );
+                return Ok(sol);
+            }
+
+            // Stall detection and periodic reset
+            if step_ok && f_ok && gnext_norm >= 0.99 * g_norm {
+                stall_count += 1;
+            } else {
+                stall_count = 0;
+            }
+            if stall_count >= 3 {
+                log::warn!("[BFGS] Stalled 3 iterations; resetting B_inv to identity.");
+                b_inv = Array2::eye(n);
+                self.resets_count.set(self.resets_count.get() + 1);
+                stall_count = 0;
             }
 
             x_k += &s_k;
             f_k = f_next;
             g_k = g_next;
+            // Keep trust radius unchanged on line-search success to avoid blow-up on non-convex cases
+            // Update GLL window and global best
+            self.gll.borrow_mut().push(f_k);
+            // Avoid overlapping borrows on RefCell
+            let maybe_f = {
+                let gb = self.global_best.borrow();
+                gb.as_ref().map(|b| b.f)
+            };
+            match maybe_f {
+                Some(bf) => {
+                    if f_k < bf - eps_f(bf, 100.0) {
+                        self.global_best.borrow_mut().replace(ProbeBest { f: f_k, x: x_k.clone(), g: g_k.clone() });
+                    }
+                }
+                None => {
+                    self.global_best.borrow_mut().replace(ProbeBest::new(&x_k, f_k, &g_k));
+                }
+            }
+
+            // Nonmonotone stickiness countdown
+            if self.stay_nonmonotone.get() > 0 {
+                self.stay_nonmonotone.set(self.stay_nonmonotone.get() - 1);
+                if self.stay_nonmonotone.get() == 0 && self.wolfe_fail_streak.get() == 0 {
+                    self.primary_strategy.set(LineSearchStrategy::StrongWolfe);
+                }
+            }
         }
 
         // The loop finished. Construct a solution from the final state.
@@ -326,8 +783,10 @@ where
             func_evals,
             grad_evals,
         });
-
-        // Return the new error variant containing the solution.
+        log::warn!(
+            "[BFGS] Max iterations reached: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
+            self.max_iterations, last_solution.final_value, last_solution.final_gradient_norm, last_solution.func_evals, last_solution.grad_evals, self.trust_radius.get()
+        );
         Err(BfgsError::MaxIterationsReached { last_solution })
     }
 }
@@ -337,6 +796,7 @@ where
 /// This implementation follows the structure of Algorithm 3.5 in Nocedal & Wright,
 /// with an efficient state-passing mechanism to avoid re-computation.
 fn line_search<ObjFn>(
+    this: &Bfgs<ObjFn>,
     obj_fn: &ObjFn,
     x_k: &Array1<f64>,
     d_k: &Array1<f64>,
@@ -348,7 +808,7 @@ fn line_search<ObjFn>(
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
 {
-    let mut alpha_i = 1.0; // Per Nocedal & Wright, always start with a unit step.
+    let mut alpha_i: f64 = 1.0; // Per Nocedal & Wright, always start with a unit step.
     let mut alpha_prev = 0.0;
 
     let mut f_prev = f_k;
@@ -361,27 +821,49 @@ where
     let max_attempts = 20;
     let mut func_evals = 0;
     let mut grad_evals = 0;
+    let epsF = eps_f(f_k, 1e3);
+    let mut best = ProbeBest::new(x_k, f_k, g_k);
 
     for _ in 0..max_attempts {
+        // Cap step by trust radius on length: ||alpha d|| <= Δ
+        let dnorm = d_k.dot(d_k).sqrt();
+        if dnorm.is_finite() && dnorm > 0.0 {
+            let step_cap = this.trust_radius.get() / dnorm;
+            alpha_i = alpha_i.min(step_cap);
+        }
         let x_new = x_k + alpha_i * d_k;
         let (f_i, g_i) = obj_fn(&x_new);
         func_evals += 1;
         grad_evals += 1;
+        best.consider(&x_new, f_i, &g_i);
 
-        // The sufficient decrease (Armijo) condition. A non-finite value for `f_i`
-        // indicates that the step `alpha_i` is too large, so it's treated as a
-        // failure of this condition, triggering the zoom phase.
-        if !f_i.is_finite() || f_i > f_k + c1 * alpha_i * g_k_dot_d || (func_evals > 1 && f_i >= f_prev)
+        // Handle any non-finite value early
+        let g_i_finite = g_i.iter().all(|v| v.is_finite());
+        if !f_i.is_finite() || !g_i_finite {
+            this.nonfinite_seen.set(true);
+            // shrink bracket without zooming on a bad endpoint
+            let prev = alpha_prev;
+            alpha_i = 0.5 * (alpha_prev + alpha_i);
+            if (alpha_i - prev).abs() <= 1e-16 { return Err(LineSearchError::StepSizeTooSmall); }
+            continue;
+        }
+
+        // Classic Armijo + previous worsening for bracketing (Strong-Wolfe)
+        let armijo_strict = f_i > f_k + c1 * alpha_i * g_k_dot_d + epsF;
+        let prev_worse = func_evals > 1 && f_i >= f_prev - epsF;
+        if armijo_strict || prev_worse
         {
             // The minimum is bracketed between alpha_prev and alpha_i.
             // A non-finite gradient from a non-finite function value is handled
             // robustly by the zoom function.
             let g_i_dot_d = g_i.dot(d_k);
-            return zoom(
+            let r = zoom(
+                this,
                 obj_fn,
                 x_k,
                 d_k,
                 f_k,
+                g_k,
                 g_k_dot_d,
                 c1,
                 c2,
@@ -394,23 +876,51 @@ where
                 func_evals,
                 grad_evals,
             );
+            if r.is_err() { this.global_best.borrow_mut().replace(best.clone()); }
+            return r;
         }
 
         let g_i_dot_d = g_i.dot(d_k);
         // The curvature condition.
         if g_i_dot_d.abs() <= c2 * g_k_dot_d.abs() {
             // Strong Wolfe conditions are satisfied.
+            // Expand trust radius modestly on successful strong-wolfe step
+            let delta_now = this.trust_radius.get();
+            this.trust_radius.set((delta_now * 1.25).min(1e6));
+            return Ok((alpha_i, f_i, g_i, func_evals, grad_evals));
+        }
+
+        // Approximate-Wolfe and gradient-reduction acceptors
+        let approx_curv_ok = g_i_dot_d.abs() <= c2 * g_k_dot_d.abs() + eps_g(g_k, d_k, 100.0);
+        let f_flat_ok = f_i <= f_k + epsF;
+        if approx_curv_ok && f_flat_ok {
+            this.approx_wolfe_accepts.set(this.approx_wolfe_accepts.get() + 1);
+            return Ok((alpha_i, f_i, g_i, func_evals, grad_evals));
+        }
+        let gi_norm = g_i.iter().fold(0.0, |acc, &v| acc + v*v).sqrt();
+        let gk_norm = g_k.iter().fold(0.0, |acc, &v| acc + v*v).sqrt();
+        // gradient reduction requires descent-aligned direction
+        if f_flat_ok && gi_norm <= 0.9 * gk_norm && g_i_dot_d <= -eps_g(g_k, d_k, 100.0) {
+            return Ok((alpha_i, f_i, g_i, func_evals, grad_evals));
+        }
+
+        // Nonmonotone acceptance (GLL) paired with curvature can avoid zoom
+        let fmax = { let gll = this.gll.borrow(); if gll.is_empty() { f_k } else { gll.fmax() } };
+        let nonmono_ok = this.accept_nonmonotone(f_k, fmax, alpha_i, g_k_dot_d, f_i);
+        if nonmono_ok && approx_curv_ok {
             return Ok((alpha_i, f_i, g_i, func_evals, grad_evals));
         }
 
         if g_i_dot_d >= 0.0 {
             // The minimum is bracketed between alpha_i and alpha_prev.
             // The new `hi` is the current point; the new `lo` is the previous.
-            return zoom(
+            let r = zoom(
+                this,
                 obj_fn,
                 x_k,
                 d_k,
                 f_k,
+                g_k,
                 g_k_dot_d,
                 c1,
                 c2,
@@ -423,33 +933,43 @@ where
                 func_evals,
                 grad_evals,
             );
+            if r.is_err() { this.global_best.borrow_mut().replace(best.clone()); }
+            return r;
         }
 
         // The step is too short, expand the search interval and cache current state.
         alpha_prev = alpha_i;
         f_prev = f_i;
         g_prev_dot_d = g_i_dot_d;
-        alpha_i *= 2.0;
+        alpha_i = (alpha_i * 2.0).min(this.trust_radius.get());
     }
 
+    this.global_best.borrow_mut().replace(best);
+    // Probing grid before declaring failure
+    if alpha_i > 0.0 {
+        if let Some((a, f, g)) = probe_alphas(obj_fn, x_k, d_k, f_k, g_k, 0.0, alpha_i) {
+            return Ok((a, f, g, func_evals, grad_evals));
+        }
+    }
     Err(LineSearchError::MaxAttempts(max_attempts))
 }
 
 /// A simple backtracking line search that satisfies the Armijo (sufficient decrease) condition.
 fn backtracking_line_search<ObjFn>(
+    this: &Bfgs<ObjFn>,
     obj_fn: &ObjFn,
     x_k: &Array1<f64>,
     d_k: &Array1<f64>,
     f_k: f64,
     g_k: &Array1<f64>,
-    c1: f64,
+    _c1: f64,
 ) -> Result<(f64, f64, Array1<f64>, usize, usize), LineSearchError>
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
 {
-    let mut alpha = 1.0;
-    let rho = 0.5;
-    let max_attempts = 30;
+    let mut alpha: f64 = 1.0;
+    let mut rho = 0.5;
+    let max_attempts = 50;
 
     let g_k_dot_d = g_k.dot(d_k);
     // A backtracking search is only valid on a descent direction.
@@ -459,23 +979,66 @@ where
 
     let mut func_evals = 0;
     let mut grad_evals = 0;
+    let mut best = ProbeBest::new(x_k, f_k, g_k);
+    let epsF = eps_f(f_k, 1e3);
+    let mut no_change_count = 0usize;
+    let mut expanded_once = false;
     for _ in 0..max_attempts {
+        // Cap step by trust radius on length: ||alpha d|| <= Δ
+        let dnorm = d_k.dot(d_k).sqrt();
+        if dnorm.is_finite() && dnorm > 0.0 {
+            let step_cap = this.trust_radius.get() / dnorm;
+            alpha = alpha.min(step_cap);
+        }
         let x_new = x_k + alpha * d_k;
         let (f_new, g_new) = obj_fn(&x_new);
         func_evals += 1;
         grad_evals += 1;
+        best.consider(&x_new, f_new, &g_new);
 
-        if f_new.is_finite() && f_new <= f_k + c1 * alpha * g_k_dot_d {
+        // If evaluation is non-finite, shrink alpha and continue (salvage best-so-far)
+        if !f_new.is_finite() || g_new.iter().any(|v| !v.is_finite()) {
+            this.nonfinite_seen.set(true);
+            alpha *= rho;
+            if alpha < 1e-16 { return Err(LineSearchError::StepSizeTooSmall); }
+            continue;
+        }
+
+        let fmax = { let gll = this.gll.borrow(); if gll.is_empty() { f_k } else { gll.fmax() } };
+        let armijo_accept = this.accept_nonmonotone(f_k, fmax, alpha, g_k_dot_d, f_new);
+        if f_new.is_finite() && armijo_accept {
             return Ok((alpha, f_new, g_new, func_evals, grad_evals));
         }
 
-        alpha *= rho;
-        // Prevent pathologically small steps from causing an infinite loop.
-        if alpha < 1e-16 {
-            return Err(LineSearchError::StepSizeTooSmall);
+        // Gradient reduction acceptance
+        let gnew_norm = g_new.iter().fold(0.0, |acc, &v| acc + v*v).sqrt();
+        let gk_norm = g_k.iter().fold(0.0, |acc, &v| acc + v*v).sqrt();
+        if f_new <= f_k + epsF && gnew_norm <= 0.9 * gk_norm && g_new.dot(d_k) <= -eps_g(g_k, d_k, 100.0) {
+            return Ok((alpha, f_new, g_new, func_evals, grad_evals));
         }
+
+        // Approximate curvature + flat f acceptance (parity with line_search)
+        let approx_curv_ok = g_new.dot(d_k).abs() <= this.c2_adapt.get() * g_k_dot_d.abs() + eps_g(g_k, d_k, 100.0);
+        if f_new <= f_k + epsF && approx_curv_ok {
+            return Ok((alpha, f_new, g_new, func_evals, grad_evals));
+        }
+
+        if (f_new - f_k).abs() <= epsF { no_change_count += 1; } else { no_change_count = 0; expanded_once = false; }
+        if no_change_count >= 3 { rho = 0.8; }
+        if no_change_count >= 2 && !expanded_once {
+            // one-time expansion to hop flat plateau
+            alpha /= rho; // slight expand
+            expanded_once = true;
+        } else {
+            alpha *= rho;
+        }
+        // Relative step-size stop: ||alpha d|| <= tol_x
+        let tol_x = 1e-12 * (1.0 + x_k.dot(x_k).sqrt()) + 1e-16;
+        if (alpha * dnorm) <= tol_x { return Err(LineSearchError::StepSizeTooSmall); }
     }
 
+    // Stash best seen during backtracking
+    this.global_best.borrow_mut().replace(best);
     Err(LineSearchError::MaxAttempts(max_attempts))
 }
 
@@ -487,10 +1050,12 @@ where
 /// interval until a suitable step size is found.
 #[allow(clippy::too_many_arguments)]
 fn zoom<ObjFn>(
+    this: &Bfgs<ObjFn>,
     obj_fn: &ObjFn,
     x_k: &Array1<f64>,
     d_k: &Array1<f64>,
     f_k: f64,
+    g_k: &Array1<f64>,
     g_k_dot_d: f64,
     c1: f64,
     c2: f64,
@@ -506,10 +1071,49 @@ fn zoom<ObjFn>(
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
 {
-    let max_zoom_attempts = 10;
+    let max_zoom_attempts = 15;
     let min_alpha_step = 1e-12; // Prevents division by zero or degenerate steps.
-
+    let epsF = eps_f(f_k, 1e3);
+    let mut best = ProbeBest::new(x_k, f_k, g_k);
     for _ in 0..max_zoom_attempts {
+        // Early exits on tiny bracket or flat ends
+        if (alpha_hi - alpha_lo).abs() <= 1e-12 || (f_hi - f_lo).abs() <= epsF {
+            let choose_lo = g_lo_dot_d.abs() <= g_hi_dot_d.abs();
+            let mut alpha_j = if choose_lo { alpha_lo } else { alpha_hi };
+            // Avoid zero step; prefer the nonzero endpoint, otherwise midpoint
+            if alpha_j <= f64::EPSILON { alpha_j = if choose_lo { alpha_hi } else { alpha_lo }; }
+            if alpha_j <= f64::EPSILON { alpha_j = 0.5 * (alpha_lo + alpha_hi); }
+            let x_j = x_k + alpha_j * d_k;
+            let (f_j, g_j) = obj_fn(&x_j);
+            func_evals += 1; grad_evals += 1;
+            if !f_j.is_finite() || g_j.iter().any(|&v| !v.is_finite()) {
+                this.nonfinite_seen.set(true);
+                if choose_lo { alpha_lo = 0.5 * (alpha_lo + alpha_hi); g_lo_dot_d = g_k_dot_d; }
+                else { alpha_hi = 0.5 * (alpha_lo + alpha_hi); g_hi_dot_d = g_k_dot_d; }
+                continue;
+            }
+            // Acceptance guard (use unified rules + gradient reduction)
+            let fmax = { let gll = this.gll.borrow(); if gll.is_empty() { f_k } else { gll.fmax() } };
+            let armijo_ok = this.accept_nonmonotone(f_k, fmax, alpha_j, g_k_dot_d, f_j);
+            let curv_ok = g_j.dot(d_k).abs() <= c2 * g_k_dot_d.abs() + eps_g(&g_j, d_k, 100.0);
+            let f_flat_ok = f_j <= f_k + epsF;
+            let gj_norm = g_j.iter().fold(0.0, |acc, &v| acc + v*v).sqrt();
+            let gk_norm = g_k.iter().fold(0.0, |acc, &v| acc + v*v).sqrt();
+            let grad_reduce_ok = f_flat_ok && (gj_norm <= 0.9 * gk_norm) && (g_j.dot(d_k) <= -eps_g(&g_j, d_k, 100.0));
+            if armijo_ok || (f_flat_ok && curv_ok) || grad_reduce_ok {
+                return Ok((alpha_j, f_j, g_j, func_evals, grad_evals));
+            } else {
+                // tighten bracket and continue
+                let g_j_dot_d = g_j.dot(d_k);
+                let mid = 0.5 * (alpha_lo + alpha_hi);
+                if alpha_j > mid {
+                    alpha_hi = alpha_j; f_hi = f_j; g_hi_dot_d = g_j_dot_d;
+                } else {
+                    alpha_lo = alpha_j; f_lo = f_j; g_lo_dot_d = g_j_dot_d;
+                }
+                continue;
+            }
+        }
         // --- Use cubic interpolation to find a trial step size `alpha_j` ---
         // If the entire bracket is in an unusable (infinite) region, fail immediately.
         if !f_lo.is_finite() && !f_hi.is_finite() {
@@ -566,16 +1170,25 @@ where
         let (f_j, g_j) = obj_fn(&x_j);
         func_evals += 1;
         grad_evals += 1;
+        best.consider(&x_j, f_j, &g_j);
 
-        // A NaN value indicates a fatal numerical error (e.g., domain error)
-        // from which the optimizer cannot recover.
-        if f_j.is_nan() || g_j.iter().any(|&v| v.is_nan()) {
-            return Err(LineSearchError::MaxAttempts(max_zoom_attempts));
+        // Handle non-finite by shrinking bracket rather than fatal error; keep derivative info intact
+        if !f_j.is_finite() || g_j.iter().any(|&v| !v.is_finite()) {
+            this.nonfinite_seen.set(true);
+            // shrink from the side of alpha_j; neutralize derivative so it won't bias endpoint choice
+            alpha_hi = alpha_j;
+            f_hi = f_j;
+            g_hi_dot_d = g_k_dot_d; // neutral derivative magnitude for non-finite endpoint
+            continue;
         }
 
         // Check if the new point `alpha_j` satisfies the sufficient decrease condition.
         // An infinite `f_j` means the step was too large and failed the condition.
-        if !f_j.is_finite() || f_j > f_k + c1 * alpha_j * g_k_dot_d || f_j >= f_lo {
+        let fmax = { let gll = this.gll.borrow(); if gll.is_empty() { f_k } else { gll.fmax() } };
+        let armijo_ok = f_j <= f_k + c1 * alpha_j * g_k_dot_d + epsF;
+        let armijo_gll_ok = f_j <= fmax + c1 * alpha_j * g_k_dot_d + epsF;
+        if !f_j.is_finite() || (!armijo_ok && !armijo_gll_ok) || f_j >= f_lo - epsF {
+            if !f_j.is_finite() { this.nonfinite_seen.set(true); }
             // The new point is not good enough, shrink the interval from the high end.
             alpha_hi = alpha_j;
             f_hi = f_j;
@@ -583,7 +1196,9 @@ where
         } else {
             let g_j_dot_d = g_j.dot(d_k);
             // Check the curvature condition.
-            if g_j_dot_d.abs() <= c2 * g_k_dot_d.abs() {
+            if g_j_dot_d.abs() <= c2 * g_k_dot_d.abs()
+                || (g_j_dot_d.abs() <= c2 * g_k_dot_d.abs() + eps_g(&g_j, d_k, 100.0) && f_j <= f_k + epsF)
+            {
                 // Success: Strong Wolfe conditions are met.
                 return Ok((alpha_j, f_j, g_j, func_evals, grad_evals));
             }
@@ -605,9 +1220,47 @@ where
             }
         }
     }
+    // Probing grid before declaring failure
+    if let Some((a, f, g)) = probe_alphas(obj_fn, x_k, d_k, f_k, g_k, alpha_lo.min(alpha_hi), alpha_lo.max(alpha_hi)) {
+        return Ok((a, f, g, func_evals, grad_evals));
+    }
+    this.global_best.borrow_mut().replace(best);
     Err(LineSearchError::MaxAttempts(max_zoom_attempts))
 }
 
+fn probe_alphas<ObjFn>(
+    obj_fn: &ObjFn,
+    x_k: &Array1<f64>,
+    d_k: &Array1<f64>,
+    f_k: f64,
+    g_k: &Array1<f64>,
+    a_lo: f64,
+    a_hi: f64,
+) -> Option<(f64, f64, Array1<f64>)>
+where
+    ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
+{
+    let cands = [0.2, 0.5, 0.8].map(|t| a_lo + t * (a_hi - a_lo));
+    let epsF = eps_f(f_k, 1e3);
+    let gk_norm = g_k.dot(g_k).sqrt();
+    let mut best: Option<(f64, f64, Array1<f64>)> = None;
+    for &a in &cands {
+        if !a.is_finite() || a <= 0.0 { continue; }
+        let x = x_k + a * d_k;
+        let (f, g) = obj_fn(&x);
+        if !f.is_finite() || g.iter().any(|v| !v.is_finite()) { continue; }
+        let ok_f = f <= f_k + epsF;
+        let gi_norm = g.dot(&g).sqrt();
+        let dir_ok = g.dot(d_k) <= -eps_g(g_k, d_k, 100.0);
+        let ok_g = gi_norm <= 0.9 * gk_norm && dir_ok;
+        if ok_f || ok_g {
+            if best.as_ref().map(|(fb,_,_)| f < *fb).unwrap_or(true) {
+                best = Some((f, a, g));
+            }
+        }
+    }
+    best.map(|(f,a,g)| (a, f, g))
+}
 
 #[cfg(test)]
 mod tests {
@@ -784,6 +1437,7 @@ mod tests {
     fn test_non_convex_function_is_handled() {
         let x0 = array![2.0];
         let result = Bfgs::new(x0.clone(), non_convex_max).run();
+        eprintln!("non_convex result: {:?}", result);
         // The robust solver should not fail. It gets stuck trying to minimize a function with no minimum.
         // It will hit the max iteration limit because it can't find steps that satisfy the descent condition.
         assert!(matches!(result, Err(BfgsError::MaxIterationsReached { .. })));
@@ -943,4 +1597,8 @@ mod tests {
         let soln = result.unwrap();
         assert_that!(&soln.final_point[0]).is_close_to(60.0, 1e-4);
     }
+}
+#[inline]
+fn scaled_identity(n: usize, lambda: f64) -> Array2<f64> {
+    Array2::<f64>::eye(n) * lambda
 }
