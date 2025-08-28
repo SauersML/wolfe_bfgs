@@ -1598,7 +1598,3 @@ mod tests {
         assert_that!(&soln.final_point[0]).is_close_to(60.0, 1e-4);
     }
 }
-#[inline]
-fn scaled_identity(n: usize, lambda: f64) -> Array2<f64> {
-    Array2::<f64>::eye(n) * lambda
-}
