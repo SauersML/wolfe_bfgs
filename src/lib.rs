@@ -5,15 +5,31 @@
 //! built upon the principles outlined in "Numerical Optimization" by Nocedal & Wright.
 //!
 //! # Features
-//! - A line search implementing the **Strong Wolfe conditions** to ensure stability.
-//!   Global convergence is guaranteed for convex problems. For non-convex
-//!   problems, BFGS is a powerful and widely-used heuristic but may not always
-//!   converge to a local minimum.
-//! - A **scaling heuristic** for the initial Hessian approximation, which often
-//!   improves the rate of convergence.
-//! - A clear, configurable, and ergonomic API using the builder pattern.
-//! - **Robust termination criteria**, ensuring the algorithm always halts, either
-//!   at a solution or with a descriptive error for diagnostics.
+//! - Hybrid line search: Strong Wolfe with nonmonotone (GLL) Armijo, approximate-Wolfe, and
+//!   gradient-reduction acceptors, plus a best-seen salvage path and a small probing grid.
+//! - Trust-region (dogleg) fallback with SPD enforcement on the inverse Hessian and scaled-identity
+//!   resets under severe noise.
+//! - Epsilon-aware tolerances with configurable multipliers via `with_fp_tolerances` for rough,
+//!   piecewise-flat objectives.
+//! - Adaptive strategy switching (Wolfe <-> Backtracking) based on success streaks (no timed flips).
+//! - Optional flat-bracket midpoint acceptance inside zoom (`with_accept_flat_midpoint_once`). Default: enabled.
+//! - Stochastic jiggling of step sizes on persistent flats (default ON; configurable via
+//!   `with_jiggle_on_flats`). Helps hop over repeated rank thresholds in piecewise‑flat regions.
+//! - Multi-direction (coordinate) rescue when progress is flat (default ON; configurable via
+//!   `with_multi_direction_rescue`). Probes small ±coordinate steps if two consecutive flat accepts
+//!   occur and adopts the one that reduces gradient norm without worsening f.
+//!
+//! ## Defaults (key settings)
+//! - Line search: Strong Wolfe primary; GLL nonmonotone Armijo; approximate‑Wolfe and gradient‑drop
+//!   acceptors; probing grid; keep‑best salvage.
+//! - Trust region: dogleg fallback enabled; Δ₀ = min(1, 10/||g₀||); adaptive by ρ; SPD enforcement
+//!   and scaled‑identity resets when needed.
+//! - Tolerances: `c1=1e-4`, `c2=0.9`; FP tolerances via `with_fp_tolerances(tau_f=1e3, tau_g=1e2)`.
+//! - Zoom midpoint: flat‑bracket midpoint acceptance (default ON; `with_accept_flat_midpoint_once`).
+//! - Stochastic jiggling: default ON with scale 1e‑3 (only after repeated flats in backtracking).
+//! - Coordinate rescue: default ON (only after two consecutive flat accepts).
+//! - Strategy switching: switch Wolfe<->Backtracking only on success/failure streaks (no timed flips).
+//! - Clear, configurable builder API, and robust termination with informative errors.
 //!
 //! # Example
 //!
@@ -47,6 +63,8 @@
 //! } = Bfgs::new(x0, rosenbrock)
 //!     .with_tolerance(1e-6)
 //!     .with_max_iterations(100)
+//!     .with_fp_tolerances(1e3, 1e2)
+//!     .with_accept_flat_midpoint_once(true)
 //!     .run()
 //!     .expect("BFGS failed to solve");
 //!
@@ -61,7 +79,7 @@
 //! ```
 
 use log;
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array1, Array2};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
@@ -132,6 +150,11 @@ fn chol_solve(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
     x
 }
 
+// Helper: return a scaled identity matrix (lambda * I_n)
+fn scaled_identity(n: usize, lambda: f64) -> Array2<f64> {
+    Array2::<f64>::eye(n) * lambda
+}
+
 // An enum to manage the adaptive strategy.
 #[derive(Debug, Clone, Copy)]
 enum LineSearchStrategy {
@@ -139,6 +162,7 @@ enum LineSearchStrategy {
     Backtracking,
 }
 
+#[derive(Debug)]
 enum LineSearchError {
     MaxAttempts(usize),
     StepSizeTooSmall,
@@ -198,6 +222,17 @@ where
     c2: f64,
     tau_f: f64,
     tau_g: f64,
+    // If true, when the zoom bracket degenerates with flat f at both ends and
+    // similar endpoint slopes, accept the midpoint once without additional
+    // Armijo/curvature checks to break out of flat regions.
+    accept_flat_midpoint_once: bool,
+    // Optional: jiggle alpha slightly on persistent flats to hop thresholds
+    jiggle_on_flats: bool,
+    jiggle_scale: f64,
+    rng_state: Cell<u64>,
+    // Optional: try a short coordinate rescue after consecutive flat accepts
+    multi_direction_rescue: bool,
+    flat_accept_streak: Cell<usize>,
     // --- Private adaptive state (no API change) ---
     gll: RefCell<GllWindow>,
     c1_adapt: Cell<f64>,
@@ -211,13 +246,17 @@ where
     tr_fallbacks: Cell<usize>,
     strategy_switches: Cell<usize>,
     resets_count: Cell<usize>,
-    stay_nonmonotone: Cell<usize>,
     nonfinite_seen: Cell<bool>,
     wolfe_clean_successes: Cell<usize>,
     bt_clean_successes: Cell<usize>,
     ls_failures_in_row: Cell<usize>,
     chol_fail_iters: Cell<usize>,
     spd_fail_seen: Cell<bool>,
+    // Scratch buffers to reduce allocations in hot paths
+    scratch_eye: RefCell<Array2<f64>>,      // identity
+    scratch_left: RefCell<Array2<f64>>,     // left = I - rho s y^T
+    scratch_right: RefCell<Array2<f64>>,    // right = I - rho y s^T
+    scratch_tmp: RefCell<Array2<f64>>,      // temporary for matmul chains
 }
 
 impl<ObjFn> Bfgs<ObjFn>
@@ -225,6 +264,117 @@ where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
 {
     const FALLBACK_THRESHOLD: usize = 3;
+
+    // Attempt one trust-region dogleg step. Updates trust radius and, on success,
+    // returns new (x, f, g) and updates `b_inv` cautiously. On failure, may shrink Δ.
+    fn try_trust_region_step(
+        &self,
+        b_inv: &mut Array2<f64>,
+        x_k: &Array1<f64>,
+        f_k: f64,
+        g_k: &Array1<f64>,
+        func_evals: &mut usize,
+        grad_evals: &mut usize,
+    ) -> Option<(Array1<f64>, f64, Array1<f64>)> {
+        let n = b_inv.nrows();
+        let delta = self.trust_radius.get();
+        let (p_tr, pred_dec) = self.trust_region_dogleg(b_inv, g_k, delta)?;
+        let x_try = x_k + &p_tr;
+        let g_old = g_k.clone();
+        let (f_try, g_try) = (self.obj_fn)(&x_try);
+        *func_evals += 1; *grad_evals += 1;
+        let act_dec = f_k - f_try;
+        if !pred_dec.is_finite() || pred_dec <= 0.0 {
+            self.trust_radius.set((delta*0.5).max(1e-12));
+            return None;
+        }
+        let rho = act_dec / pred_dec;
+        self.tr_fallbacks.set(self.tr_fallbacks.get() + 1);
+        if rho > 0.75 && p_tr.dot(&p_tr).sqrt() > 0.99*delta { self.trust_radius.set((delta*2.0).min(1e6)); }
+        else if rho < 0.25 { self.trust_radius.set((delta*0.5).max(1e-12)); }
+        if rho <= 0.1 || !f_try.is_finite() || g_try.iter().any(|v| !v.is_finite()) { return None; }
+        // Accept TR step
+        // Update GLL window and global best
+        self.gll.borrow_mut().push(f_try);
+        let maybe_f = { let gb = self.global_best.borrow(); gb.as_ref().map(|b| b.f) };
+        if let Some(bf) = maybe_f {
+            if f_try < bf - eps_f(bf, self.tau_f) {
+                self.global_best.borrow_mut().replace(ProbeBest { f: f_try, x: x_try.clone(), g: g_try.clone() });
+            }
+        } else {
+            self.global_best.borrow_mut().replace(ProbeBest::new(&x_try, f_try, &g_try));
+        }
+
+        // Inverse update: skip on poor model; otherwise cautious Powell-damped
+        let poor_model = rho <= 0.25;
+        let s_tr = p_tr.clone();
+        let s_norm_tr = s_tr.dot(&s_tr).sqrt();
+        if !poor_model && s_norm_tr > 1e-14 {
+            let mut binv_upd = b_inv.clone();
+            let mut Lopt = chol_decompose(&binv_upd);
+            if Lopt.is_none() {
+                self.spd_fail_seen.set(true);
+                let mean_diag = (0..n).map(|i| binv_upd[[i,i]].abs()).sum::<f64>()/(n as f64);
+                let ridge = (1e-10*mean_diag).max(1e-16);
+                for i in 0..n { binv_upd[[i,i]] += ridge; }
+                Lopt = chol_decompose(&binv_upd);
+            }
+            if let Some(L) = Lopt {
+                let h_s = chol_solve(&L, &s_tr);
+                let s_h_s = s_tr.dot(&h_s);
+                let y_tr = &g_try - &g_old;
+                let sy_tr = s_tr.dot(&y_tr);
+                let theta = if sy_tr < 0.2 * s_h_s { 0.8 * s_h_s / (s_h_s - sy_tr) } else { 1.0 };
+                let y_tilde = &y_tr * theta + &h_s * (1.0 - theta);
+                let sty = s_tr.dot(&y_tilde);
+                let y_norm = y_tilde.dot(&y_tilde).sqrt();
+                let rel = if s_norm_tr > 0.0 && y_norm > 0.0 { sty / (s_norm_tr * y_norm) } else { 0.0 };
+                if !sty.is_finite() || rel < 1e-8 {
+                    for i in 0..n { b_inv[[i,i]] *= 1.0 + 1e-3; }
+                } else {
+                    let rho_inv = 1.0 / sty;
+                    {
+                        let eye = self.scratch_eye.borrow();
+                        let mut left = self.scratch_left.borrow_mut();
+                        let mut right = self.scratch_right.borrow_mut();
+                        left.assign(&*eye);
+                        right.assign(&*eye);
+                        for i in 0..n {
+                            let si = s_tr[i];
+                            let yi = y_tilde[i];
+                            for j in 0..n {
+                                let yj = y_tilde[j];
+                                let sj = s_tr[j];
+                                left[[i,j]] -= rho_inv * si * yj;
+                                right[[i,j]] -= rho_inv * yi * sj;
+                            }
+                        }
+                        let mut tmp = self.scratch_tmp.borrow_mut();
+                        *tmp = left.dot(&*b_inv);
+                        *b_inv = tmp.dot(&*right);
+                    }
+                    for i in 0..n { for j in 0..n { b_inv[[i,j]] += rho_inv * s_tr[i] * s_tr[j]; } }
+                }
+                // Regularize and symmetry enforce
+                for i in 0..n { for j in (i+1)..n { let v=0.5*(b_inv[[i,j]]+b_inv[[j,i]]); b_inv[[i,j]]=v; b_inv[[j,i]]=v; } }
+                let mut diag_min = f64::INFINITY;
+                for i in 0..n { diag_min = diag_min.min(b_inv[[i,i]]); }
+                if !diag_min.is_finite() || diag_min <= 0.0 { for i in 0..n { b_inv[[i,i]] += 1e-12; } }
+            } else {
+                self.spd_fail_seen.set(true);
+                self.chol_fail_iters.set(self.chol_fail_iters.get()+1);
+            }
+            if self.spd_fail_seen.get() && self.chol_fail_iters.get() >= 2 {
+                let y_tr = &g_try - &g_old;
+                let s_norm = s_tr.dot(&s_tr).sqrt();
+                let y_norm = y_tr.dot(&y_tr).sqrt();
+                let lambda = if y_norm > 0.0 { (s_norm / y_norm).clamp(1e-3, 1e3) } else { 1.0 };
+                *b_inv = scaled_identity(n, lambda);
+                self.chol_fail_iters.set(0);
+            }
+        }
+        Some((x_try, f_try, g_try))
+    }
 
     /// Creates a new BFGS solver.
     ///
@@ -241,6 +391,12 @@ where
             c2: 0.9,  // Standard value for curvature condition
             tau_f: 1e3,
             tau_g: 1e2,
+            accept_flat_midpoint_once: true,
+            jiggle_on_flats: true,
+            jiggle_scale: 1e-3,
+            rng_state: Cell::new(0xB5F0_D00D_1234_5678u64),
+            multi_direction_rescue: true,
+            flat_accept_streak: Cell::new(0),
             gll: RefCell::new(GllWindow::new(8)),
             c1_adapt: Cell::new(1e-4),
             c2_adapt: Cell::new(0.9),
@@ -252,13 +408,16 @@ where
             tr_fallbacks: Cell::new(0),
             strategy_switches: Cell::new(0),
             resets_count: Cell::new(0),
-            stay_nonmonotone: Cell::new(0),
             nonfinite_seen: Cell::new(false),
             wolfe_clean_successes: Cell::new(0),
             bt_clean_successes: Cell::new(0),
             ls_failures_in_row: Cell::new(0),
             chol_fail_iters: Cell::new(0),
             spd_fail_seen: Cell::new(false),
+            scratch_eye: RefCell::new(Array2::<f64>::zeros((0,0))),
+            scratch_left: RefCell::new(Array2::<f64>::zeros((0,0))),
+            scratch_right: RefCell::new(Array2::<f64>::zeros((0,0))),
+            scratch_tmp: RefCell::new(Array2::<f64>::zeros((0,0))),
         }
     }
 
@@ -283,7 +442,9 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
                     Some(L2) => L2,
                     None => {
                         // reset to scaled identity and retry once
-                        let lambda = mean_diag.clamp(1e-6, 1e6);
+                        let mut lambda = mean_diag;
+                        if !lambda.is_finite() || lambda <= 0.0 { lambda = 1.0; }
+                        lambda = lambda.clamp(1e-6, 1e6);
                         binv = scaled_identity(n, lambda);
                         match chol_decompose(&binv) {
                             Some(L3) => L3,
@@ -355,9 +516,53 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
         self
     }
 
+    /// If enabled, when `zoom` detects a flat bracket with similar endpoint slopes,
+    /// it will accept the midpoint once without further checks to escape flat regions.
+    pub fn with_accept_flat_midpoint_once(mut self, enable: bool) -> Self {
+        self.accept_flat_midpoint_once = enable;
+        self
+    }
+
+    /// Enable stochastic jiggling of alpha on persistent flat evaluations in
+    /// backtracking. `scale` is the relative perturbation amplitude (e.g. 1e-3).
+    pub fn with_jiggle_on_flats(mut self, enable: bool, scale: f64) -> Self {
+        self.jiggle_on_flats = enable;
+        if scale.is_finite() && scale > 0.0 { self.jiggle_scale = scale.min(1e-1); }
+        self
+    }
+
+    /// Enable a simple multi-direction rescue: after two consecutive flat
+    /// accepts, try a short coordinate probe and adopt it if it reduces the
+    /// gradient norm without worsening f.
+    pub fn with_multi_direction_rescue(mut self, enable: bool) -> Self {
+        self.multi_direction_rescue = enable;
+        self
+    }
+
+    // Tiny xorshift64* RNG for jiggling without external deps. Returns in [-1, 1].
+    fn next_rand_sym(&self) -> f64 {
+        let mut x = self.rng_state.get();
+        // xorshift64*
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x2545F4914F6CDD1Du64);
+        self.rng_state.set(x);
+        // Map to (0,1): use upper 53 bits to f64 fraction
+        let u = ((x >> 11) as f64) * (1.0 / (1u64 << 53) as f64);
+        2.0 * u - 1.0
+    }
+
+    /// Set the RNG seed used for stochastic jiggling (for reproducibility).
+    pub fn with_rng_seed(self, seed: u64) -> Self {
+        self.rng_state.set(seed);
+        self
+    }
+
     /// Executes the BFGS algorithm with the adaptive hybrid line search.
     pub fn run(&self) -> Result<BfgsSolution, BfgsError> {
         let n = self.x0.len();
+        self.ensure_scratch(n);
         let mut x_k = self.x0.clone();
         let (mut f_k, mut g_k) = (self.obj_fn)(&x_k);
         let mut func_evals = 1;
@@ -376,6 +581,7 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
         self.nonfinite_seen.set(false);
         self.chol_fail_iters.set(0);
         self.spd_fail_seen.set(false);
+        self.flat_accept_streak.set(0);
 
         let mut b_inv = Array2::<f64>::eye(n);
 
@@ -390,7 +596,7 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
         self.c2_adapt.set(self.c2);
         self.primary_strategy.set(LineSearchStrategy::StrongWolfe);
         self.wolfe_fail_streak.set(0);
-        self.stay_nonmonotone.set(0);
+        // removed timed nonmonotone countdown; rely on clean-success switching only
         // Initialize trust radius from gradient scale
         let g0_norm = g_k.dot(&g_k).sqrt();
         let delta0 = if g0_norm.is_finite() && g0_norm > 0.0 { (10.0 / g0_norm).min(1.0) } else { 1.0 };
@@ -400,9 +606,9 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
         for k in 0..self.max_iterations {
             // reset per-iteration state
             self.nonfinite_seen.set(false);
-            self.chol_fail_iters.set(0);
-            self.spd_fail_seen.set(false);
-            let g_norm = g_k.dot(&g_k).sqrt();
+        self.chol_fail_iters.set(0);
+        self.spd_fail_seen.set(false);
+        let g_norm = g_k.dot(&g_k).sqrt();
             if !g_norm.is_finite() {
                 log::warn!("[BFGS] Non-finite gradient norm at iter {}: g_norm={:?}", k, g_norm);
                 return Err(BfgsError::GradientIsNaN);
@@ -434,10 +640,10 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
             }
 
             // --- Adaptive Hybrid Line Search Execution ---
-            let (alpha_k, f_next, g_next, f_evals, g_evals) = {
+            let (alpha_k, mut f_next, mut g_next, f_evals, g_evals) = {
                 let search_result = match self.primary_strategy.get() {
                     LineSearchStrategy::StrongWolfe => line_search(self, &self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1_adapt.get(), self.c2_adapt.get()),
-                    LineSearchStrategy::Backtracking => backtracking_line_search(self, &self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1_adapt.get()),
+                    LineSearchStrategy::Backtracking => backtracking_line_search(self, &self.obj_fn, &x_k, &present_d_k, f_k, &g_k),
                 };
 
                 match search_result {
@@ -481,7 +687,7 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
                             if self.ls_failures_in_row.get() >= 2 {
                                 self.gll.borrow_mut().cap = 10;
                             }
-                            let fallback_result = backtracking_line_search(self, &self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1_adapt.get());
+                            let fallback_result = backtracking_line_search(self, &self.obj_fn, &x_k, &present_d_k, f_k, &g_k);
                             if let Ok(result) = fallback_result {
                                 // Fallback succeeded.
                                 result
@@ -501,88 +707,9 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
                                     }
                                 }
                                 // Try full trust-region dogleg fallback before giving up
-                                let delta = self.trust_radius.get();
-                                if let Some((p_tr, pred_dec)) = self.trust_region_dogleg(&b_inv, &g_k, delta) {
-                                    let x_try = &x_k + &p_tr;
-                                    let g_old = g_k.clone();
-                                    let (f_try, g_try) = (self.obj_fn)(&x_try);
-                                    func_evals += 1; grad_evals += 1;
-                                    let act_dec = f_k - f_try;
-                                    if !pred_dec.is_finite() || pred_dec <= 0.0 { self.trust_radius.set((delta*0.5).max(1e-12)); } else {
-                                        let rho = act_dec / pred_dec;
-                                        self.tr_fallbacks.set(self.tr_fallbacks.get() + 1);
-                                        if rho > 0.1 && f_try.is_finite() && g_try.iter().all(|v| v.is_finite()) {
-                                            x_k = x_try; f_k = f_try; g_k = g_try.clone();
-                                            // Update GLL window and global best
-                                            self.gll.borrow_mut().push(f_k);
-                                        let maybe_f = { let gb = self.global_best.borrow(); gb.as_ref().map(|b| b.f) };
-                                        if let Some(bf) = maybe_f {
-                                            if f_k < bf - eps_f(bf, self.tau_f) {
-                                                self.global_best.borrow_mut().replace(ProbeBest { f: f_k, x: x_k.clone(), g: g_k.clone() });
-                                            }
-                                        } else {
-                                            self.global_best.borrow_mut().replace(ProbeBest::new(&x_k, f_k, &g_k));
-                                        }
-                                            if rho > 0.75 && p_tr.dot(&p_tr).sqrt() > 0.99*delta { self.trust_radius.set((delta*2.0).min(1e6)); }
-                                            else if rho < 0.25 { self.trust_radius.set((delta*0.5).max(1e-12)); }
-                                            let poor_model = rho <= 0.25;
-                                            let s_tr = p_tr.clone();
-                                            let y_tr = &g_try - &g_old;
-                                            let s_norm_tr = s_tr.dot(&s_tr).sqrt();
-                                            if !poor_model && s_norm_tr > 1e-14 {
-                                                let mut binv_upd = b_inv.clone();
-                                                let mut Lopt = chol_decompose(&binv_upd);
-                                                if Lopt.is_none() {
-                                                    self.spd_fail_seen.set(true);
-                                                    let mean_diag = (0..n).map(|i| binv_upd[[i,i]].abs()).sum::<f64>()/(n as f64);
-                                                    let ridge = (1e-10*mean_diag).max(1e-16);
-                                                    for i in 0..n { binv_upd[[i,i]] += ridge; }
-                                                    Lopt = chol_decompose(&binv_upd);
-                                                }
-                                                if let Some(L) = Lopt {
-                                                    let h_s = chol_solve(&L, &s_tr);
-                                                    let s_h_s = s_tr.dot(&h_s);
-                                                    let sy_tr = s_tr.dot(&y_tr);
-                                                    let theta = if sy_tr < 0.2 * s_h_s { 0.8 * s_h_s / (s_h_s - sy_tr) } else { 1.0 };
-                                                    let y_tilde = &y_tr * theta + &h_s * (1.0 - theta);
-                                                    let sty = s_tr.dot(&y_tilde);
-                                                    let y_norm = y_tilde.dot(&y_tilde).sqrt();
-                                                    let rel = if s_norm_tr > 0.0 && y_norm > 0.0 { sty / (s_norm_tr * y_norm) } else { 0.0 };
-                                                    if sty.is_finite() && rel >= 1e-8 {
-                                                        let rho_up = 1.0 / sty;
-                                                        let s_col = s_tr.view().insert_axis(Axis(1));
-                                                        let s_row = s_tr.view().insert_axis(Axis(0));
-                                                        let y_col = y_tilde.view().insert_axis(Axis(1));
-                                                        let y_row = y_tilde.view().insert_axis(Axis(0));
-                                                        let eye = Array2::<f64>::eye(n);
-                                                        let left  = &eye - &(rho_up * s_col.dot(&y_row));
-                                                        let right = &eye - &(rho_up * y_col.dot(&s_row));
-                                                        let s_s_t = s_col.dot(&s_row);
-                                                        let tmp = left.dot(&b_inv).dot(&right);
-                                                        b_inv = tmp + rho_up * s_s_t;
-                                                        b_inv = (&b_inv + &b_inv.t()) * 0.5;
-                                                    } else {
-                                                        self.chol_fail_iters.set(self.chol_fail_iters.get()+1);
-                                                        for i in 0..n { b_inv[[i,i]] *= 1.0 + 1e-3; }
-                                                    }
-                                                } else {
-                                                    self.chol_fail_iters.set(self.chol_fail_iters.get()+1);
-                                                    self.spd_fail_seen.set(true);
-                                                }
-                                            } else {
-                                                for i in 0..n { b_inv[[i,i]] *= 1.0 + 1e-3; }
-                                            }
-                                            if self.spd_fail_seen.get() && self.chol_fail_iters.get() >= 2 {
-                                                let s_norm = s_tr.dot(&s_tr).sqrt();
-                                                let y_norm = y_tr.dot(&y_tr).sqrt();
-                                                let lambda = if y_norm > 0.0 { (s_norm / y_norm).clamp(1e-3, 1e3) } else { 1.0 };
-                                                b_inv = scaled_identity(n, lambda);
-                                                self.resets_count.set(self.resets_count.get()+1);
-                                                self.chol_fail_iters.set(0);
-                                            }
-                                            continue;
-                                        }
-                                    }
+                                if let Some((x_new, f_new, g_new)) = self.try_trust_region_step(&mut b_inv, &x_k, f_k, &g_k, &mut func_evals, &mut grad_evals) {
+                                    x_k = x_new; f_k = f_new; g_k = g_new;
+                                    continue;
                                 }
                                 // Shrink trust radius; if non-finite seen, return error; else continue
                                 self.trust_radius.set((self.trust_radius.get()*0.5).max(1e-12));
@@ -613,42 +740,15 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
                             log::error!("[BFGS Adaptive] CRITICAL: Backtracking failed at iter {}. Resetting Hessian.", k);
                             b_inv = Array2::<f64>::eye(n);
                             present_d_k = -g_k.clone();
-                            let fallback_result = backtracking_line_search(self, &self.obj_fn, &x_k, &present_d_k, f_k, &g_k, self.c1_adapt.get());
+                            let fallback_result = backtracking_line_search(self, &self.obj_fn, &x_k, &present_d_k, f_k, &g_k);
                             if let Ok(result) = fallback_result {
                                 result
                             } else {
                                 let max_attempts = if let Err(LineSearchError::MaxAttempts(attempts)) = fallback_result { attempts } else { 0 };
                                 // Full trust-region dogleg fallback
-                                let delta = self.trust_radius.get();
-                                if let Some((p_tr, pred_dec)) = self.trust_region_dogleg(&b_inv, &g_k, delta) {
-                                    let x_try = &x_k + &p_tr;
-                                    let (f_try, g_try) = (self.obj_fn)(&x_try);
-                                    func_evals += 1; grad_evals += 1;
-                                    let act_dec = f_k - f_try;
-                                    if !pred_dec.is_finite() || pred_dec <= 0.0 { self.trust_radius.set((delta*0.5).max(1e-12)); } else {
-                                        let rho = act_dec / pred_dec;
-                                        self.tr_fallbacks.set(self.tr_fallbacks.get() + 1);
-                                        if rho > 0.1 && f_try.is_finite() && g_try.iter().all(|v| v.is_finite()) {
-                                        x_k = x_try; f_k = f_try; g_k = g_try;
-                                        self.gll.borrow_mut().push(f_k);
-                                        let maybe_f = { let gb = self.global_best.borrow(); gb.as_ref().map(|b| b.f) };
-                                        if let Some(bf) = maybe_f {
-                                            if f_k < bf - eps_f(bf, self.tau_f) {
-                                                self.global_best.borrow_mut().replace(ProbeBest { f: f_k, x: x_k.clone(), g: g_k.clone() });
-                                            }
-                                        } else {
-                                            self.global_best.borrow_mut().replace(ProbeBest::new(&x_k, f_k, &g_k));
-                                        }
-                                        if rho > 0.75 && p_tr.dot(&p_tr).sqrt() > 0.99*delta { self.trust_radius.set((delta*2.0).min(1e6)); }
-                                        else if rho < 0.25 { self.trust_radius.set((delta*0.5).max(1e-12)); }
-                                        if rho <= 0.25 {
-                                            for i in 0..n { b_inv[[i,i]] *= 1.0 + 1e-3; }
-                                        }
-                                        continue;
-                                        } else {
-                                            self.trust_radius.set((delta*0.5).max(1e-12));
-                                        }
-                                    }
+                                if let Some((x_new, f_new, g_new)) = self.try_trust_region_step(&mut b_inv, &x_k, f_k, &g_k, &mut func_evals, &mut grad_evals) {
+                                    x_k = x_new; f_k = f_new; g_k = g_new;
+                                    continue;
                                 }
                                 if let Some(b) = self.global_best.borrow().as_ref() {
                                     let epsF = eps_f(f_k, self.tau_f);
@@ -689,13 +789,72 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
                 }
             };
 
+            // Optional coordinate rescue after consecutive flat accepts
+            let mut s_override: Option<Array1<f64>> = None;
+            let mut rescued = false;
+            if self.multi_direction_rescue {
+                let epsF_iter = eps_f(f_k, self.tau_f);
+                let flat_now = (f_next - f_k).abs() <= epsF_iter;
+                if flat_now { self.flat_accept_streak.set(self.flat_accept_streak.get()+1); } else { self.flat_accept_streak.set(0); }
+                if self.flat_accept_streak.get() >= 2 {
+                    let x_next = &x_k + &(alpha_k * &present_d_k);
+                    let gnext_norm0 = g_next.dot(&g_next).sqrt();
+                    let delta = self.trust_radius.get();
+                    let eta = (0.2 * delta).min(1.0 / (1.0 + gnext_norm0));
+                    if eta.is_finite() && eta > 0.0 {
+                        let n = x_k.len();
+                        let mut best_x = None;
+                        let mut best_f = f_next;
+                        let mut best_g = g_next.clone();
+                        for i in 0..n {
+                            for &sgn in &[-1.0, 1.0] {
+                                let mut x_try = x_next.clone();
+                                x_try[i] = x_try[i] + sgn * eta; // coordinate poke from x_next
+                                let (f_try, g_try) = (self.obj_fn)(&x_try);
+                                func_evals += 1; grad_evals += 1;
+                                if !f_try.is_finite() || g_try.iter().any(|v| !v.is_finite()) { continue; }
+                                let g_try_norm = g_try.dot(&g_try).sqrt();
+                                let f_thresh = f_k.min(f_next) + epsF_iter;
+                                let descent_ok = g_try.dot(&present_d_k) <= -eps_g(&g_k, &present_d_k, self.tau_g);
+                                if f_try <= f_thresh && g_try_norm <= 0.9 * gnext_norm0 && descent_ok {
+                                    if f_try <= best_f { best_f = f_try; best_x = Some(x_try.clone()); best_g = g_try.clone(); }
+                                }
+                            }
+                        }
+                        if let Some(xb) = best_x {
+                            // Enforce trust radius on the rescue step
+                            let mut s_tmp = &xb - &x_k;
+                            let s_norm = s_tmp.dot(&s_tmp).sqrt();
+                            let delta = self.trust_radius.get();
+                            if s_norm.is_finite() && s_norm > delta && delta.is_finite() && delta > 0.0 {
+                                let scale = delta / s_norm;
+                                let x_scaled = &x_k + &(s_tmp.mapv(|v| v * scale));
+                                let (f_s, g_s) = (self.obj_fn)(&x_scaled);
+                                func_evals += 1; grad_evals += 1;
+                                if f_s.is_finite() && g_s.iter().all(|v| v.is_finite()) {
+                                    s_tmp = &x_scaled - &x_k;
+                                    f_next = f_s; g_next = g_s;
+                                } else {
+                                    // fall back to original xb
+                                    f_next = best_f; g_next = best_g.clone();
+                                }
+                            } else {
+                                f_next = best_f; g_next = best_g.clone();
+                            }
+                            s_override = Some(s_tmp);
+                            rescued = true;
+                            self.flat_accept_streak.set(0);
+                        }
+                    }
+                }
+            }
+
             // The "Learner" part: promote Backtracking if Wolfe keeps failing.
             if self.wolfe_fail_streak.get() >= Self::FALLBACK_THRESHOLD {
                 log::warn!("[BFGS Adaptive] Fallback streak ({}) reached. Switching primary to Backtracking.", self.wolfe_fail_streak.get());
                 self.primary_strategy.set(LineSearchStrategy::Backtracking);
                 self.strategy_switches.set(self.strategy_switches.get() + 1);
                 self.wolfe_fail_streak.set(0);
-                self.stay_nonmonotone.set(10);
             }
             // Switch back to StrongWolfe after a run of clean backtracking successes
             if matches!(self.primary_strategy.get(), LineSearchStrategy::Backtracking)
@@ -710,7 +869,7 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
             func_evals += f_evals;
             grad_evals += g_evals;
 
-            let s_k = alpha_k * &present_d_k;
+            let s_k = if let Some(s) = s_override { s } else { alpha_k * &present_d_k };
             let y_k = &g_next - &g_k;
 
             // --- Cautious Hessian Update ---
@@ -727,53 +886,89 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
                 // Powell-damped inverse BFGS update (keep SPD)
                 let s_norm = s_k.dot(&s_k).sqrt();
                 if s_norm > 1e-14 {
-                    // Compute H s via solving B_inv * (H s) = s
-                    let mut binv_upd = b_inv.clone();
-                    let mut Lopt = chol_decompose(&binv_upd);
-                    if Lopt.is_none() {
-                        self.spd_fail_seen.set(true);
-                        let mean_diag = (0..n).map(|i| binv_upd[[i,i]].abs()).sum::<f64>()/(n as f64);
-                        let ridge = (1e-10*mean_diag).max(1e-16);
-                        for i in 0..n { binv_upd[[i,i]] += ridge; }
-                        Lopt = chol_decompose(&binv_upd);
-                    }
-                    if let Some(L) = Lopt {
-                        let h_s = chol_solve(&L, &s_k);
-                        let s_h_s = s_k.dot(&h_s);
-                        let theta = if sy < 0.2 * s_h_s { 0.8 * s_h_s / (s_h_s - sy) } else { 1.0 };
-                        let y_tilde = &y_k * theta + &h_s * (1.0 - theta);
-                        let sty = s_k.dot(&y_tilde);
-                        let y_norm = y_tilde.dot(&y_tilde).sqrt();
-                        let rel = if s_norm > 0.0 && y_norm > 0.0 { sty / (s_norm * y_norm) } else { 0.0 };
-                        if !sty.is_finite() || rel < 1e-8 {
-                            log::warn!("[BFGS] s^T y_tilde non-positive/tiny; skipping update and inflating diag.");
-                            self.chol_fail_iters.set(self.chol_fail_iters.get()+1);
-                            for i in 0..n { b_inv[[i,i]] *= 1.0 + 1e-3; }
+                    if !rescued {
+                        // Compute H s via solving B_inv * (H s) = s
+                        let mut binv_upd = b_inv.clone();
+                        let mut Lopt = chol_decompose(&binv_upd);
+                        if Lopt.is_none() {
+                            self.spd_fail_seen.set(true);
+                            let mean_diag = (0..n).map(|i| binv_upd[[i,i]].abs()).sum::<f64>()/(n as f64);
+                            let ridge = (1e-10*mean_diag).max(1e-16);
+                            for i in 0..n { binv_upd[[i,i]] += ridge; }
+                            Lopt = chol_decompose(&binv_upd);
+                        }
+                        if let Some(L) = Lopt {
+                            let h_s = chol_solve(&L, &s_k);
+                            let s_h_s = s_k.dot(&h_s);
+                            let theta = if sy < 0.2 * s_h_s { 0.8 * s_h_s / (s_h_s - sy) } else { 1.0 };
+                            let y_tilde = &y_k * theta + &h_s * (1.0 - theta);
+                            let sty = s_k.dot(&y_tilde);
+                            let y_norm = y_tilde.dot(&y_tilde).sqrt();
+                            let rel = if s_norm > 0.0 && y_norm > 0.0 { sty / (s_norm * y_norm) } else { 0.0 };
+                            if !sty.is_finite() || rel < 1e-8 {
+                                log::warn!("[BFGS] s^T y_tilde non-positive/tiny; skipping update and inflating diag.");
+                                self.chol_fail_iters.set(self.chol_fail_iters.get()+1);
+                                for i in 0..n { b_inv[[i,i]] *= 1.0 + 1e-3; }
+                            } else {
+                                // Build left = I - rho * s y^T and right = I - rho * y s^T using scratch buffers
+                                let rho_inv = 1.0 / sty;
+                                {
+                                    let eye = self.scratch_eye.borrow();
+                                    let mut left = self.scratch_left.borrow_mut();
+                                    let mut right = self.scratch_right.borrow_mut();
+                                    // left = I
+                                    left.assign(&*eye);
+                                    right.assign(&*eye);
+                                    // left -= rho_inv * s y^T; right -= rho_inv * y s^T
+                                    for i in 0..n {
+                                        let si = s_k[i];
+                                        let yi = y_tilde[i];
+                                        for j in 0..n {
+                                            let yj = y_tilde[j];
+                                            let sj = s_k[j];
+                                            left[[i,j]] -= rho_inv * si * yj;
+                                            right[[i,j]] -= rho_inv * yi * sj;
+                                        }
+                                    }
+                                    // tmp = left * b_inv
+                                    let mut tmp = self.scratch_tmp.borrow_mut();
+                                    *tmp = left.dot(&b_inv);
+                                    // b_inv = tmp * right
+                                    b_inv = tmp.dot(&*right);
+                                }
+                                // b_inv += rho_inv * s s^T
+                                for i in 0..n {
+                                    for j in 0..n {
+                                        b_inv[[i,j]] += rho_inv * s_k[i] * s_k[j];
+                                    }
+                                }
+                            }
                         } else {
-                            let rho = 1.0 / sty;
-                            let s_col = s_k.view().insert_axis(Axis(1));
-                            let s_row = s_k.view().insert_axis(Axis(0));
-                            let y_col = y_tilde.view().insert_axis(Axis(1));
-                            let y_row = y_tilde.view().insert_axis(Axis(0));
-                            let eye = Array2::<f64>::eye(n);
-                            let left  = &eye - &(rho * s_col.dot(&y_row));
-                            let right = &eye - &(rho * y_col.dot(&s_row));
-                            let s_s_t = s_col.dot(&s_row);
-                            let tmp = left.dot(&b_inv).dot(&right);
-                            b_inv = tmp + rho * s_s_t;
+                            self.chol_fail_iters.set(self.chol_fail_iters.get()+1);
+                            self.spd_fail_seen.set(true);
+                            log::warn!("[BFGS] B_inv not SPD after ridge; skipping update this iter.");
                         }
                     } else {
-                        self.chol_fail_iters.set(self.chol_fail_iters.get()+1);
-                        self.spd_fail_seen.set(true);
-                        log::warn!("[BFGS] B_inv not SPD after ridge; skipping update this iter.");
+                        log::info!("[BFGS] Coordinate rescue used; skipping inverse update this iter.");
                     }
                     // Enforce symmetry and gentle regularization
-                    b_inv = (&b_inv + &b_inv.t()) * 0.5;
+                    // Symmetrize in-place
+                    for i in 0..n {
+                        for j in (i+1)..n {
+                            let a = b_inv[[i,j]];
+                            let b = b_inv[[j,i]];
+                            let v = 0.5 * (a + b);
+                            b_inv[[i,j]] = v;
+                            b_inv[[j,i]] = v;
+                        }
+                    }
                     let mut diag_min = f64::INFINITY;
                     for i in 0..n { diag_min = diag_min.min(b_inv[[i,i]]); }
                     if !diag_min.is_finite() || diag_min <= 0.0 {
-                        let fro = b_inv.mapv(|v| v*v).sum().sqrt();
-                        let delta = 1e-12 * fro;
+                        // Simple diagonal bump proportional to trace
+                        let mut trace = 0.0;
+                        for i in 0..n { trace += b_inv[[i,i]].abs(); }
+                        let delta = 1e-12 * trace.max(1.0);
                         for i in 0..n { b_inv[[i,i]] += delta; }
                     }
                 }
@@ -844,12 +1039,9 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
             }
 
             // Nonmonotone stickiness countdown
-            if self.stay_nonmonotone.get() > 0 {
-                self.stay_nonmonotone.set(self.stay_nonmonotone.get() - 1);
-                if self.stay_nonmonotone.get() == 0 && self.wolfe_fail_streak.get() == 0 {
-                    self.primary_strategy.set(LineSearchStrategy::StrongWolfe);
-                }
-            }
+            // Removed time-based flip-back to StrongWolfe to avoid thrashing.
+            // We return to StrongWolfe only after a run of clean backtracking
+            // successes (handled above via `bt_clean_successes`).
         }
 
         // The loop finished. Construct a solution from the final state.
@@ -867,6 +1059,21 @@ fn trust_region_dogleg(&self, b_inv: &Array2<f64>, g: &Array1<f64>, delta: f64) 
             self.max_iterations, last_solution.final_value, last_solution.final_gradient_norm, last_solution.func_evals, last_solution.grad_evals, self.trust_radius.get()
         );
         Err(BfgsError::MaxIterationsReached { last_solution })
+    }
+
+    fn ensure_scratch(&self, n: usize) {
+        // Ensure scratch matrices are allocated and sized n x n; initialize identity
+        let mut eye = self.scratch_eye.borrow_mut();
+        if eye.nrows() != n || eye.ncols() != n {
+            *eye = Array2::<f64>::zeros((n, n));
+            for i in 0..n { eye[[i,i]] = 1.0; }
+        }
+        let mut left = self.scratch_left.borrow_mut();
+        if left.nrows() != n || left.ncols() != n { *left = Array2::<f64>::zeros((n, n)); }
+        let mut right = self.scratch_right.borrow_mut();
+        if right.nrows() != n || right.ncols() != n { *right = Array2::<f64>::zeros((n, n)); }
+        let mut tmp = self.scratch_tmp.borrow_mut();
+        if tmp.nrows() != n || tmp.ncols() != n { *tmp = Array2::<f64>::zeros((n, n)); }
     }
 }
 
@@ -1024,7 +1231,12 @@ where
         alpha_prev = alpha_i;
         f_prev = f_i;
         g_prev_dot_d = g_i_dot_d;
-        alpha_i = (alpha_i * 2.0).min(this.trust_radius.get());
+        // Expand alpha but respect trust radius on step length (units-consistent)
+        let step_cap = {
+            let dnorm = d_k.dot(d_k).sqrt();
+            if dnorm.is_finite() && dnorm > 0.0 { this.trust_radius.get() / dnorm } else { f64::INFINITY }
+        };
+        alpha_i = (alpha_i * 2.0).min(step_cap);
     }
 
     this.global_best.borrow_mut().replace(best);
@@ -1045,7 +1257,6 @@ fn backtracking_line_search<ObjFn>(
     d_k: &Array1<f64>,
     f_k: f64,
     g_k: &Array1<f64>,
-    _c1: f64,
 ) -> Result<(f64, f64, Array1<f64>, usize, usize), LineSearchError>
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
@@ -1114,6 +1325,11 @@ where
             expanded_once = true;
         } else {
             alpha *= rho;
+        }
+        // Stochastic jiggling to avoid hitting identical thresholds repeatedly
+        if this.jiggle_on_flats && no_change_count >= 2 {
+            let jiggle = 1.0 + this.jiggle_scale * this.next_rand_sym();
+            alpha = (alpha * jiggle).max(f64::EPSILON);
         }
         // Relative step-size stop: ||alpha d|| <= tol_x
         let tol_x = 1e-12 * (1.0 + x_k.dot(x_k).sqrt()) + 1e-16;
@@ -1207,6 +1423,10 @@ where
             let (f_mid, g_mid) = obj_fn(&x_mid);
             func_evals += 1; grad_evals += 1;
             if f_mid.is_finite() && g_mid.iter().all(|v| v.is_finite()) {
+                // Optional unconditional midpoint acceptance in flat, similar-slope brackets
+                if this.accept_flat_midpoint_once {
+                    return Ok((alpha_mid, f_mid, g_mid, func_evals, grad_evals));
+                }
                 let fmax = { let gll = this.gll.borrow(); if gll.is_empty() { f_k } else { gll.fmax() } };
                 let armijo_ok = this.accept_nonmonotone(f_k, fmax, alpha_mid, g_k_dot_d, f_mid);
                 let curv_ok = g_mid.dot(d_k).abs() <= c2 * g_k_dot_d.abs() + eps_g(&g_mid, d_k, this.tau_g);
@@ -1287,12 +1507,16 @@ where
         grad_evals += 1;
         best.consider(&x_j, f_j, &g_j);
 
-        // Handle non-finite by shrinking bracket rather than fatal error; keep derivative info intact
+        // Handle non-finite by shrinking toward the finite end; keep derivative info intact
         if !f_j.is_finite() || g_j.iter().any(|&v| !v.is_finite()) {
             this.nonfinite_seen.set(true);
-            alpha_hi = alpha_j;
-            f_hi = f_j;
-            hi_deriv_known = false;
+            // Move the bound closer to alpha_j, prefer shrinking the side that alpha_j is nearer to
+            let to_hi = (alpha_hi - alpha_j).abs() <= (alpha_j - alpha_lo).abs();
+            if to_hi {
+                alpha_hi = alpha_j; f_hi = f_j; hi_deriv_known = false;
+            } else {
+                alpha_lo = alpha_j; f_lo = f_j; lo_deriv_known = false;
+            }
             continue;
         }
 
@@ -1646,7 +1870,7 @@ mod tests {
         let tolerance = 1e-8;
 
         // Run our implementation.
-        let _our_res = match Bfgs::new(x0.clone(), quadratic)
+        match Bfgs::new(x0.clone(), quadratic)
             .with_tolerance(tolerance)
             .run()
         {
@@ -1737,4 +1961,18 @@ mod tests {
         let res = Bfgs::new(x0, f).run();
         assert!(res.is_ok() || matches!(res, Err(super::BfgsError::MaxIterationsReached { .. })));
     }
+
+    #[test]
+    fn test_rng_symmetry() {
+        // Ensure the internal RNG produces a roughly symmetric distribution.
+        let x0 = array![0.0];
+        let f = |x: &Array1<f64>| (x[0], array![1.0]);
+        let solver = super::Bfgs::new(x0, f).with_rng_seed(12345);
+        let mut sum = 0.0f64;
+        let n = 20_000;
+        for _ in 0..n { sum += solver.next_rand_sym(); }
+        let mean = sum / (n as f64);
+        assert_that!(&mean.abs()).is_less_than(5e-3);
+    }
+
 }
