@@ -231,6 +231,8 @@ enum LineSearchError {
     StepSizeTooSmall,
 }
 
+type LsResult = Result<(f64, f64, Array1<f64>, usize, usize, AcceptKind), LineSearchError>;
+
 /// An error type for clear diagnostics.
 #[derive(Debug, thiserror::Error)]
 pub enum BfgsError {
@@ -375,7 +377,6 @@ where
             return None;
         }
         let rho = act_dec / pred_dec;
-        self.tr_fallbacks.set(self.tr_fallbacks.get() + 1);
         if rho > 0.75 && p_tr.dot(&p_tr).sqrt() > 0.99 * delta {
             self.trust_radius.set((delta * 2.0).min(1e6));
         } else if rho < 0.25 {
@@ -528,6 +529,7 @@ where
         } else {
             update_status = "skipped";
         }
+        self.tr_fallbacks.set(self.tr_fallbacks.get() + 1);
         log::info!(
             "[BFGS] step accepted via {:?}; inverse update {}",
             AcceptKind::TrustRegion,
@@ -1756,6 +1758,7 @@ where
 ///
 /// This implementation follows the structure of Algorithm 3.5 in Nocedal & Wright,
 /// with an efficient state-passing mechanism to avoid re-computation.
+#[allow(clippy::too_many_arguments)]
 fn line_search<ObjFn>(
     this: &Bfgs<ObjFn>,
     obj_fn: &ObjFn,
@@ -1765,7 +1768,7 @@ fn line_search<ObjFn>(
     g_k: &Array1<f64>,
     c1: f64,
     c2: f64,
-) -> Result<(f64, f64, Array1<f64>, usize, usize, AcceptKind), LineSearchError>
+) -> LsResult
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
 {
@@ -1815,6 +1818,8 @@ where
                     this.tau_f,
                     this.tau_g,
                     this.grad_drop_factor.get(),
+                    &mut func_evals,
+                    &mut grad_evals,
                 ) {
                     return Ok((a, f, g, func_evals, grad_evals, kind));
                 }
@@ -1977,6 +1982,8 @@ where
             this.tau_f,
             this.tau_g,
             this.grad_drop_factor.get(),
+            &mut func_evals,
+            &mut grad_evals,
         )
     {
         return Ok((a, f, g, func_evals, grad_evals, kind));
@@ -1992,7 +1999,7 @@ fn backtracking_line_search<ObjFn>(
     d_k: &Array1<f64>,
     f_k: f64,
     g_k: &Array1<f64>,
-) -> Result<(f64, f64, Array1<f64>, usize, usize, AcceptKind), LineSearchError>
+) -> LsResult
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
 {
@@ -2113,6 +2120,26 @@ where
         }
     }
 
+    // Probing grid before declaring failure
+    if alpha > 0.0
+        && let Some((a, f, g, kind)) = probe_alphas(
+            obj_fn,
+            x_k,
+            d_k,
+            f_k,
+            g_k,
+            0.0,
+            alpha,
+            this.tau_f,
+            this.tau_g,
+            this.grad_drop_factor.get(),
+            &mut func_evals,
+            &mut grad_evals,
+        )
+    {
+        return Ok((a, f, g, func_evals, grad_evals, kind));
+    }
+
     // Stash best seen during backtracking
     this.global_best.borrow_mut().replace(best);
     Err(LineSearchError::MaxAttempts(max_attempts))
@@ -2142,7 +2169,7 @@ fn zoom<ObjFn>(
     mut g_hi_dot_d: f64,
     mut func_evals: usize,
     mut grad_evals: usize,
-) -> Result<(f64, f64, Array1<f64>, usize, usize, AcceptKind), LineSearchError>
+) -> LsResult
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
 {
@@ -2155,8 +2182,18 @@ where
     for _ in 0..max_zoom_attempts {
         // Early exits on tiny bracket or flat ends
         if (alpha_hi - alpha_lo).abs() <= 1e-12 || (f_hi - f_lo).abs() <= epsF {
-            let choose_lo = g_lo_dot_d.abs() <= g_hi_dot_d.abs();
-            let mut alpha_j = if choose_lo { alpha_lo } else { alpha_hi };
+            let (mut alpha_j, choose_lo) = match (lo_deriv_known, hi_deriv_known) {
+                (true, true) => {
+                    if g_lo_dot_d.abs() <= g_hi_dot_d.abs() {
+                        (alpha_lo, true)
+                    } else {
+                        (alpha_hi, false)
+                    }
+                }
+                (true, false) => (alpha_lo, true),
+                (false, true) => (alpha_hi, false),
+                (false, false) => ((alpha_lo + alpha_hi) / 2.0, false),
+            };
             // Avoid zero step; prefer the nonzero endpoint, otherwise midpoint
             if alpha_j <= f64::EPSILON {
                 alpha_j = if choose_lo { alpha_hi } else { alpha_lo };
@@ -2186,15 +2223,14 @@ where
             };
             let armijo_ok = this.accept_nonmonotone(f_k, fmax, alpha_j, g_k_dot_d, f_j);
             let curv_ok = g_j.dot(d_k).abs()
-                <= c2 * g_k_dot_d.abs()
-                    + this.curv_slack_scale.get() * eps_g(&g_j, d_k, this.tau_g);
+                <= c2 * g_k_dot_d.abs() + this.curv_slack_scale.get() * eps_g(g_k, d_k, this.tau_g);
             let f_flat_ok = f_j <= f_k + epsF;
             let gj_norm = g_j.iter().fold(0.0, |acc, &v| acc + v * v).sqrt();
             let gk_norm = g_k.iter().fold(0.0, |acc, &v| acc + v * v).sqrt();
             let drop_factor = this.grad_drop_factor.get();
             let grad_reduce_ok = f_flat_ok
                 && (gj_norm <= drop_factor * gk_norm)
-                && (g_j.dot(d_k) <= -eps_g(&g_j, d_k, this.tau_g));
+                && (g_j.dot(d_k) <= -eps_g(g_k, d_k, this.tau_g));
             if armijo_ok {
                 return Ok((
                     alpha_j,
@@ -2268,7 +2304,7 @@ where
                 let armijo_ok = this.accept_nonmonotone(f_k, fmax, alpha_mid, g_k_dot_d, f_mid);
                 let curv_ok = g_mid.dot(d_k).abs()
                     <= c2 * g_k_dot_d.abs()
-                        + this.curv_slack_scale.get() * eps_g(&g_mid, d_k, this.tau_g);
+                        + this.curv_slack_scale.get() * eps_g(g_k, d_k, this.tau_g);
                 let gdrop =
                     g_mid.dot(&g_mid).sqrt() <= this.grad_drop_factor.get() * g_k.dot(g_k).sqrt();
                 if armijo_ok && curv_ok {
@@ -2343,9 +2379,9 @@ where
                 (alpha_lo + alpha_hi) / 2.0
             } else {
                 let d1 = g_lo_dot_d + g_hi_dot_d - 3.0 * (f_hi - f_lo) / alpha_diff;
-                let d2_sq = d1.powi(2) - g_lo_dot_d * g_hi_dot_d;
+                let d2_sq = d1 * d1 - g_lo_dot_d * g_hi_dot_d;
 
-                if d2_sq.is_sign_positive() {
+                if d2_sq >= 0.0 && d2_sq.is_finite() {
                     let d2 = d2_sq.sqrt();
                     let trial = alpha_hi
                         - alpha_diff * (g_hi_dot_d + d2 - d1)
@@ -2426,7 +2462,7 @@ where
                     AcceptKind::StrongWolfe,
                 ));
             } else if g_j_dot_d.abs()
-                <= c2 * g_k_dot_d.abs() + this.curv_slack_scale.get() * eps_g(&g_j, d_k, this.tau_g)
+                <= c2 * g_k_dot_d.abs() + this.curv_slack_scale.get() * eps_g(g_k, d_k, this.tau_g)
                 && f_j <= f_k + epsF
             {
                 return Ok((
@@ -2470,6 +2506,8 @@ where
         this.tau_f,
         this.tau_g,
         this.grad_drop_factor.get(),
+        &mut func_evals,
+        &mut grad_evals,
     ) {
         return Ok((a, f, g, func_evals, grad_evals, kind));
     }
@@ -2477,6 +2515,7 @@ where
     Err(LineSearchError::MaxAttempts(max_zoom_attempts))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn probe_alphas<ObjFn>(
     obj_fn: &ObjFn,
     x_k: &Array1<f64>,
@@ -2488,6 +2527,8 @@ fn probe_alphas<ObjFn>(
     tau_f: f64,
     tau_g: f64,
     drop_factor: f64,
+    fe: &mut usize,
+    ge: &mut usize,
 ) -> Option<(f64, f64, Array1<f64>, AcceptKind)>
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
@@ -2502,6 +2543,8 @@ where
         }
         let x = x_k + a * d_k;
         let (f, g) = obj_fn(&x);
+        *fe += 1;
+        *ge += 1;
         if !f.is_finite() || g.iter().any(|v| !v.is_finite()) {
             continue;
         }
