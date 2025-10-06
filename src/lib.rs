@@ -1614,7 +1614,6 @@ where
                 self.grad_drop_factor.set(0.9);
             }
 
-            let g_proj_next = self.projected_gradient(&x_next, &g_next);
             let mut y_k = &g_next - &g_k;
 
             if self.bounds.is_some() {
@@ -2475,7 +2474,7 @@ where
                     grad_evals,
                     AcceptKind::Nonmonotone,
                 ));
-            } else if f_flat_ok && curv_ok && g_j.dot(d_k) <= 0.0 {
+            } else if f_flat_ok && curv_ok && g_j_dot_d <= 0.0 {
                 return Ok((
                     alpha_j,
                     f_j,
@@ -2512,7 +2511,7 @@ where
         }
         let flat_f = (f_hi - f_lo).abs() <= epsF;
         let similar_slope = (g_hi_dot_d.abs() - g_lo_dot_d.abs()).abs()
-            <= this.curv_slack_scale.get() * eps_g(g_k, d_k, this.tau_g);
+            <= this.curv_slack_scale.get() * eps_g(g_proj_k, d_k, this.tau_g);
         if flat_f && similar_slope {
             let alpha_mid = 0.5 * (alpha_lo + alpha_hi);
             let (x_mid, s_mid, kink_mid) = this.project_with_step(x_k, d_k, alpha_mid);
@@ -2529,6 +2528,7 @@ where
                 // Optional midpoint acceptance in flat, similar-slope brackets (guard with descent sign)
                 let g_proj_mid = this.projected_gradient(&x_mid, &g_mid);
                 let g_mid_dot_d = g_proj_mid.dot(d_k);
+                let dir_ok = g_mid_dot_d <= -eps_g(g_proj_k, d_k, this.tau_g);
                 if this.accept_flat_midpoint_once && g_mid_dot_d <= 0.0 {
                     return Ok((
                         alpha_mid,
@@ -2560,7 +2560,7 @@ where
                         grad_evals,
                         AcceptKind::Nonmonotone,
                     ));
-                } else if f_mid <= f_k + epsF && gdrop {
+                } else if f_mid <= f_k + epsF && gdrop && dir_ok {
                     return Ok((
                         alpha_mid,
                         f_mid,
