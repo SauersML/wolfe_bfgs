@@ -206,6 +206,46 @@ fn scaled_identity(n: usize, lambda: f64) -> Array2<f64> {
     Array2::<f64>::eye(n) * lambda
 }
 
+#[derive(Clone)]
+struct BoxSpec {
+    lower: Array1<f64>,
+    upper: Array1<f64>,
+    tol: f64,
+}
+
+impl BoxSpec {
+    fn new(lower: Array1<f64>, upper: Array1<f64>, tol: f64) -> Self {
+        Self { lower, upper, tol }
+    }
+
+    fn project(&self, x: &Array1<f64>) -> Array1<f64> {
+        let mut z = x.clone();
+        for i in 0..z.len() {
+            let lo = self.lower[i];
+            let hi = self.upper[i];
+            if z[i] < lo {
+                z[i] = lo;
+            } else if z[i] > hi {
+                z[i] = hi;
+            }
+        }
+        z
+    }
+
+    fn active_mask(&self, x: &Array1<f64>, g: &Array1<f64>) -> Vec<bool> {
+        let mut mask = vec![false; x.len()];
+        for i in 0..x.len() {
+            let lo = self.lower[i];
+            let hi = self.upper[i];
+            let tol = self.tol;
+            let at_lower = x[i] <= lo + tol;
+            let at_upper = x[i] >= hi - tol;
+            mask[i] = (at_lower && g[i] >= 0.0) || (at_upper && g[i] <= 0.0);
+        }
+        mask
+    }
+}
+
 // An enum to manage the adaptive strategy.
 #[derive(Debug, Clone, Copy)]
 enum LineSearchStrategy {
@@ -292,6 +332,7 @@ where
     c2: f64,
     tau_f: f64,
     tau_g: f64,
+    bounds: Option<BoxSpec>,
     // If true, when the zoom bracket degenerates with flat f at both ends and
     // similar endpoint slopes, accept the midpoint once without additional
     // Armijo/curvature checks to break out of flat regions.
@@ -365,7 +406,8 @@ where
         let n = b_inv.nrows();
         let delta = self.trust_radius.get();
         let (p_tr, pred_dec) = self.trust_region_dogleg(b_inv, g_k, delta)?;
-        let x_try = x_k + &p_tr;
+        let raw_try = x_k + &p_tr;
+        let x_try = self.project_point(&raw_try);
         let g_old = g_k.clone();
         let (f_try, g_try) = (self.obj_fn)(&x_try);
         *func_evals += 1;
@@ -552,6 +594,7 @@ where
             c2: 0.9,  // Standard value for curvature condition
             tau_f: 1e3,
             tau_g: 1e2,
+            bounds: None,
             accept_flat_midpoint_once: true,
             jiggle_on_flats: true,
             jiggle_scale: 1e-3,
@@ -700,6 +743,14 @@ where
         Some((p, pred_dec))
     }
 
+    fn project_point(&self, x: &Array1<f64>) -> Array1<f64> {
+        if let Some(bounds) = &self.bounds {
+            bounds.project(x)
+        } else {
+            x.clone()
+        }
+    }
+
     /// Sets the convergence tolerance (default: 1e-5).
     pub fn with_tolerance(mut self, tolerance: f64) -> Self {
         self.tolerance = tolerance;
@@ -709,6 +760,19 @@ where
     /// Sets the maximum number of iterations (default: 100).
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    /// Provides simple box bounds for each coordinate (lower <= x <= upper).
+    pub fn with_bounds(mut self, lower: Array1<f64>, upper: Array1<f64>, tol: f64) -> Self {
+        assert_eq!(lower.len(), upper.len(), "lower/upper lengths differ");
+        for i in 0..lower.len() {
+            assert!(
+                lower[i] <= upper[i],
+                "lower bound exceeds upper bound at index {i}"
+            );
+        }
+        self.bounds = Some(BoxSpec::new(lower, upper, tol.max(0.0)));
         self
     }
 
@@ -795,8 +859,13 @@ where
     pub fn run(&self) -> Result<BfgsSolution, BfgsError> {
         let n = self.x0.len();
         self.ensure_scratch(n);
-        let mut x_k = self.x0.clone();
+        let mut x_k = self.project_point(&self.x0);
         let (mut f_k, mut g_k) = (self.obj_fn)(&x_k);
+        let mut active_mask = if let Some(bounds) = &self.bounds {
+            bounds.active_mask(&x_k, &g_k)
+        } else {
+            vec![false; n]
+        };
         let mut func_evals = 1;
         let mut grad_evals = 1;
 
@@ -879,6 +948,22 @@ where
             }
 
             let mut present_d_k = -b_inv.dot(&g_k);
+            if let Some(bounds) = &self.bounds {
+                for (i, &active) in active_mask.iter().enumerate() {
+                    if active {
+                        present_d_k[i] = 0.0;
+                    }
+                }
+                // prevent stepping outside bounds directly from the current point
+                for i in 0..present_d_k.len() {
+                    if present_d_k[i] < 0.0 && x_k[i] <= bounds.lower[i] + bounds.tol {
+                        present_d_k[i] = 0.0;
+                    }
+                    if present_d_k[i] > 0.0 && x_k[i] >= bounds.upper[i] - bounds.tol {
+                        present_d_k[i] = 0.0;
+                    }
+                }
+            }
             // Enforce descent direction; reset if needed
             let gdotd = g_k.dot(&present_d_k);
             let dnorm = present_d_k.dot(&present_d_k).sqrt();
@@ -888,6 +973,21 @@ where
                 b_inv = Array2::eye(n);
                 present_d_k = -g_k.clone();
                 self.resets_count.set(self.resets_count.get() + 1);
+                if let Some(bounds) = &self.bounds {
+                    for (i, &active) in active_mask.iter().enumerate() {
+                        if active {
+                            present_d_k[i] = 0.0;
+                        }
+                    }
+                    for i in 0..present_d_k.len() {
+                        if present_d_k[i] < 0.0 && x_k[i] <= bounds.lower[i] + bounds.tol {
+                            present_d_k[i] = 0.0;
+                        }
+                        if present_d_k[i] > 0.0 && x_k[i] >= bounds.upper[i] - bounds.tol {
+                            present_d_k[i] = 0.0;
+                        }
+                    }
+                }
             }
 
             // --- Adaptive Hybrid Line Search Execution ---
@@ -1014,9 +1114,12 @@ where
                                                 grad_evals,
                                             });
                                         }
-                                        x_k = b.x.clone();
+                                        x_k = self.project_point(&b.x);
                                         f_k = b.f;
                                         g_k = b.g.clone();
+                                        if let Some(bounds) = &self.bounds {
+                                            active_mask = bounds.active_mask(&x_k, &g_k);
+                                        }
                                         for i in 0..n {
                                             b_inv[[i, i]] *= 1.0 + 1e-3;
                                         }
@@ -1052,6 +1155,9 @@ where
                                     x_k = x_new;
                                     f_k = f_new;
                                     g_k = g_new;
+                                    if let Some(bounds) = &self.bounds {
+                                        active_mask = bounds.active_mask(&x_k, &g_k);
+                                    }
                                     self.ls_failures_in_row.set(0);
                                     continue;
                                 }
@@ -1188,9 +1294,12 @@ where
                                                 grad_evals,
                                             });
                                         }
-                                        x_k = b.x.clone();
+                                        x_k = self.project_point(&b.x);
                                         f_k = b.f;
                                         g_k = b.g.clone();
+                                        if let Some(bounds) = &self.bounds {
+                                            active_mask = bounds.active_mask(&x_k, &g_k);
+                                        }
                                         for i in 0..n {
                                             b_inv[[i, i]] *= 1.0 + 1e-3;
                                         }
@@ -1305,6 +1414,7 @@ where
                             for &sgn in &[-1.0, 1.0] {
                                 let mut x_try = x_next.clone();
                                 x_try[i] += sgn * eta; // coordinate poke from x_next
+                                x_try = self.project_point(&x_try);
                                 let (f_try, g_try) = (self.obj_fn)(&x_try);
                                 func_evals += 1;
                                 grad_evals += 1;
@@ -1336,6 +1446,7 @@ where
                             {
                                 let scale = delta / s_norm;
                                 let x_scaled = &x_k + &(s_tmp.mapv(|v| v * scale));
+                                let x_scaled = self.project_point(&x_scaled);
                                 let (f_s, g_s) = (self.obj_fn)(&x_scaled);
                                 func_evals += 1;
                                 grad_evals += 1;
@@ -1391,11 +1502,13 @@ where
             func_evals += f_evals;
             grad_evals += g_evals;
 
-            let s_k = if let Some(ref s) = s_override {
+            let mut s_k = if let Some(ref s) = s_override {
                 s.clone()
             } else {
                 alpha_k * &present_d_k
             };
+            let x_next = self.project_point(&(x_k.clone() + &s_k));
+            s_k = &x_next - &x_k;
             let step_len = s_k.dot(&s_k).sqrt();
             if step_len.is_finite() && step_len > 0.0 {
                 if step_len >= 0.9 * self.trust_radius.get() {
@@ -1415,7 +1528,7 @@ where
             }
             if self.no_improve_streak.get() >= self.max_no_improve {
                 return Ok(BfgsSolution {
-                    final_point: x_k.clone() + &s_k,
+                    final_point: x_next.clone(),
                     final_value: f_next,
                     final_gradient_norm: g_next.dot(&g_next).sqrt(),
                     iterations: k + 1,
@@ -1672,9 +1785,12 @@ where
                 }
             }
 
-            x_k += &s_k;
+            x_k = x_next;
             f_k = f_next;
             g_k = g_next;
+            if let Some(bounds) = &self.bounds {
+                active_mask = bounds.active_mask(&x_k, &g_k);
+            }
             // Update GLL window and global best
             self.gll.borrow_mut().push(f_k);
             f_last_accepted = f_k;
@@ -1788,7 +1904,8 @@ where
     let epsF = eps_f(f_k, this.tau_f);
     let mut best = ProbeBest::new(x_k, f_k, g_k);
     for _ in 0..max_attempts {
-        let x_new = x_k + alpha_i * d_k;
+        let trial = x_k + alpha_i * d_k;
+        let x_new = this.project_point(&trial);
         let (f_i, g_i) = obj_fn(&x_new);
         func_evals += 1;
         grad_evals += 1;
@@ -1805,6 +1922,7 @@ where
             }
             if alpha_i <= 1e-18 {
                 if let Some((a, f, g, kind)) = probe_alphas(
+                    this,
                     obj_fn,
                     x_k,
                     d_k,
@@ -1969,6 +2087,7 @@ where
     // Probing grid before declaring failure
     if alpha_i > 0.0
         && let Some((a, f, g, kind)) = probe_alphas(
+            this,
             obj_fn,
             x_k,
             d_k,
@@ -2021,7 +2140,8 @@ where
     let mut expanded_once = false;
     let dnorm = d_k.dot(d_k).sqrt();
     for _ in 0..max_attempts {
-        let x_new = x_k + alpha * d_k;
+        let trial = x_k + alpha * d_k;
+        let x_new = this.project_point(&trial);
         let (f_new, g_new) = obj_fn(&x_new);
         func_evals += 1;
         grad_evals += 1;
@@ -2120,6 +2240,7 @@ where
     // Probing grid before declaring failure
     if alpha > 0.0
         && let Some((a, f, g, kind)) = probe_alphas(
+            this,
             obj_fn,
             x_k,
             d_k,
@@ -2198,7 +2319,8 @@ where
             if alpha_j <= f64::EPSILON {
                 alpha_j = 0.5 * (alpha_lo + alpha_hi);
             }
-            let x_j = x_k + alpha_j * d_k;
+            let trial = x_k + alpha_j * d_k;
+            let x_j = this.project_point(&trial);
             let (f_j, g_j) = obj_fn(&x_j);
             func_evals += 1;
             grad_evals += 1;
@@ -2278,7 +2400,8 @@ where
             <= this.curv_slack_scale.get() * eps_g(g_k, d_k, this.tau_g);
         if flat_f && similar_slope {
             let alpha_mid = 0.5 * (alpha_lo + alpha_hi);
-            let x_mid = x_k + alpha_mid * d_k;
+            let trial = x_k + alpha_mid * d_k;
+            let x_mid = this.project_point(&trial);
             let (f_mid, g_mid) = obj_fn(&x_mid);
             func_evals += 1;
             grad_evals += 1;
@@ -2406,7 +2529,8 @@ where
             alpha_j
         };
 
-        let x_j = x_k + alpha_j * d_k;
+        let trial = x_k + alpha_j * d_k;
+        let x_j = this.project_point(&trial);
         let (f_j, g_j) = obj_fn(&x_j);
         func_evals += 1;
         grad_evals += 1;
@@ -2493,6 +2617,7 @@ where
     }
     // Probing grid before declaring failure
     if let Some((a, f, g, kind)) = probe_alphas(
+        this,
         obj_fn,
         x_k,
         d_k,
@@ -2514,6 +2639,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn probe_alphas<ObjFn>(
+    this: &Bfgs<ObjFn>,
     obj_fn: &ObjFn,
     x_k: &Array1<f64>,
     d_k: &Array1<f64>,
@@ -2538,7 +2664,8 @@ where
         if !a.is_finite() || a <= 0.0 {
             continue;
         }
-        let x = x_k + a * d_k;
+        let trial = x_k + a * d_k;
+        let x = this.project_point(&trial);
         let (f, g) = obj_fn(&x);
         *fe += 1;
         *ge += 1;
