@@ -93,6 +93,13 @@ fn eps_g(gk: &Array1<f64>, dk: &Array1<f64>, tau: f64) -> f64 {
     tau * EPS * gk.dot(gk).sqrt() * dk.dot(dk).sqrt()
 }
 
+fn is_kink(raw: &Array1<f64>, projected: &Array1<f64>) -> bool {
+    raw.iter().zip(projected.iter()).any(|(r, p)| {
+        let scale = 1.0 + r.abs().max(p.abs());
+        (r - p).abs() > 1e-14 * scale
+    })
+}
+
 // Ring buffer for GLL nonmonotone Armijo (internal only)
 struct GllWindow {
     buf: VecDeque<f64>,
@@ -637,12 +644,27 @@ where
     }
 
     #[inline]
-    fn accept_nonmonotone(&self, f_k: f64, fmax: f64, alpha: f64, gkdotd: f64, f_i: f64) -> bool {
+    fn projected_gradient(&self, x: &Array1<f64>, g: &Array1<f64>) -> Array1<f64> {
+        if let Some(bounds) = &self.bounds {
+            let mask = bounds.active_mask(x, g);
+            let mut gp = g.clone();
+            for (gi, &active) in gp.iter_mut().zip(mask.iter()) {
+                if active {
+                    *gi = 0.0;
+                }
+            }
+            gp
+        } else {
+            g.clone()
+        }
+    }
+
+    #[inline]
+    fn accept_nonmonotone(&self, f_k: f64, fmax: f64, gkts: f64, f_i: f64) -> bool {
         let c1 = self.c1_adapt.get();
         let epsf_k = eps_f(f_k, self.tau_f);
         let epsf_max = eps_f(fmax, self.tau_f);
-        (f_i <= f_k + c1 * alpha * gkdotd + epsf_k)
-            || (f_i <= fmax + c1 * alpha * gkdotd + epsf_max)
+        (f_i <= f_k + c1 * gkts + epsf_k) || (f_i <= fmax + c1 * gkts + epsf_max)
     }
 
     fn trust_region_dogleg(
@@ -866,6 +888,7 @@ where
         } else {
             vec![false; n]
         };
+        let mut g_proj_k = self.projected_gradient(&x_k, &g_k);
         let mut func_evals = 1;
         let mut grad_evals = 1;
 
@@ -917,7 +940,7 @@ where
             self.nonfinite_seen.set(false);
             self.chol_fail_iters.set(0);
             self.spd_fail_seen.set(false);
-            let g_norm = g_k.dot(&g_k).sqrt();
+            let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
             if !g_norm.is_finite() {
                 log::warn!(
                     "[BFGS] Non-finite gradient norm at iter {}: g_norm={:?}",
@@ -964,6 +987,7 @@ where
                     }
                 }
             }
+            let active_before = active_mask.clone();
             // Enforce descent direction; reset if needed
             let gdotd = g_k.dot(&present_d_k);
             let dnorm = present_d_k.dot(&present_d_k).sqrt();
@@ -1091,8 +1115,9 @@ where
                                 // Salvage best point seen during line search if any
                                 if let Some(b) = self.global_best.borrow().as_ref() {
                                     let epsF = eps_f(f_k, self.tau_f);
-                                    let gk_norm = g_k.dot(&g_k).sqrt();
-                                    let gb_norm = b.g.dot(&b.g).sqrt();
+                                    let gk_norm = g_proj_k.dot(&g_proj_k).sqrt();
+                                    let gb_proj = self.projected_gradient(&b.x, &b.g);
+                                    let gb_norm = gb_proj.dot(&gb_proj).sqrt();
                                     let drop_factor = self.grad_drop_factor.get();
                                     if (b.f <= f_k + epsF && gb_norm <= drop_factor * gk_norm)
                                         || (b.f < f_k - epsF)
@@ -1108,7 +1133,7 @@ where
                                             return Ok(BfgsSolution {
                                                 final_point: b.x.clone(),
                                                 final_value: b.f,
-                                                final_gradient_norm: b.g.dot(&b.g).sqrt(),
+                                                final_gradient_norm: gb_norm,
                                                 iterations: k,
                                                 func_evals,
                                                 grad_evals,
@@ -1117,6 +1142,7 @@ where
                                         x_k = self.project_point(&b.x);
                                         f_k = b.f;
                                         g_k = b.g.clone();
+                                        g_proj_k = gb_proj;
                                         if let Some(bounds) = &self.bounds {
                                             active_mask = bounds.active_mask(&x_k, &g_k);
                                         }
@@ -1143,10 +1169,11 @@ where
                                         self.no_improve_streak.set(0);
                                     }
                                     if self.no_improve_streak.get() >= self.max_no_improve {
+                                        let g_new_proj = self.projected_gradient(&x_new, &g_new);
                                         return Ok(BfgsSolution {
                                             final_point: x_new,
                                             final_value: f_new,
-                                            final_gradient_norm: g_new.dot(&g_new).sqrt(),
+                                            final_gradient_norm: g_new_proj.dot(&g_new_proj).sqrt(),
                                             iterations: k + 1,
                                             func_evals,
                                             grad_evals,
@@ -1155,6 +1182,7 @@ where
                                     x_k = x_new;
                                     f_k = f_new;
                                     g_k = g_new;
+                                    g_proj_k = self.projected_gradient(&x_k, &g_k);
                                     if let Some(bounds) = &self.bounds {
                                         active_mask = bounds.active_mask(&x_k, &g_k);
                                     }
@@ -1177,7 +1205,8 @@ where
                                     {
                                         ls.final_point = b.x.clone();
                                         ls.final_value = b.f;
-                                        ls.final_gradient_norm = b.g.dot(&b.g).sqrt();
+                                        let gb_proj = self.projected_gradient(&b.x, &b.g);
+                                        ls.final_gradient_norm = gb_proj.dot(&gb_proj).sqrt();
                                     }
                                     log::warn!(
                                         "[BFGS] Line search failed at iter {} (nonfinite seen), fe={}, ge={}, Δ={:.3e}",
@@ -1254,10 +1283,11 @@ where
                                         self.no_improve_streak.set(0);
                                     }
                                     if self.no_improve_streak.get() >= self.max_no_improve {
+                                        let g_new_proj = self.projected_gradient(&x_new, &g_new);
                                         return Ok(BfgsSolution {
                                             final_point: x_new,
                                             final_value: f_new,
-                                            final_gradient_norm: g_new.dot(&g_new).sqrt(),
+                                            final_gradient_norm: g_new_proj.dot(&g_new_proj).sqrt(),
                                             iterations: k + 1,
                                             func_evals,
                                             grad_evals,
@@ -1266,13 +1296,15 @@ where
                                     x_k = x_new;
                                     f_k = f_new;
                                     g_k = g_new;
+                                    g_proj_k = self.projected_gradient(&x_k, &g_k);
                                     self.ls_failures_in_row.set(0);
                                     continue;
                                 }
                                 if let Some(b) = self.global_best.borrow().as_ref() {
                                     let epsF = eps_f(f_k, self.tau_f);
-                                    let gk_norm = g_k.dot(&g_k).sqrt();
-                                    let gb_norm = b.g.dot(&b.g).sqrt();
+                                    let gk_norm = g_proj_k.dot(&g_proj_k).sqrt();
+                                    let gb_proj = self.projected_gradient(&b.x, &b.g);
+                                    let gb_norm = gb_proj.dot(&gb_proj).sqrt();
                                     let drop_factor = self.grad_drop_factor.get();
                                     if (b.f <= f_k + epsF && gb_norm <= drop_factor * gk_norm)
                                         || (b.f < f_k - epsF)
@@ -1288,7 +1320,7 @@ where
                                             return Ok(BfgsSolution {
                                                 final_point: b.x.clone(),
                                                 final_value: b.f,
-                                                final_gradient_norm: b.g.dot(&b.g).sqrt(),
+                                                final_gradient_norm: gb_norm,
                                                 iterations: k,
                                                 func_evals,
                                                 grad_evals,
@@ -1297,6 +1329,7 @@ where
                                         x_k = self.project_point(&b.x);
                                         f_k = b.f;
                                         g_k = b.g.clone();
+                                        g_proj_k = gb_proj;
                                         if let Some(bounds) = &self.bounds {
                                             active_mask = bounds.active_mask(&x_k, &g_k);
                                         }
@@ -1322,7 +1355,8 @@ where
                                     {
                                         ls.final_point = b.x.clone();
                                         ls.final_value = b.f;
-                                        ls.final_gradient_norm = b.g.dot(&b.g).sqrt();
+                                        let gb_proj = self.projected_gradient(&b.x, &b.g);
+                                        ls.final_gradient_norm = gb_proj.dot(&gb_proj).sqrt();
                                     }
                                     log::warn!(
                                         "[BFGS] Line search failed at iter {} (nonfinite seen), fe={}, ge={}, Δ={:.3e}",
@@ -1423,8 +1457,9 @@ where
                                 }
                                 let g_try_norm = g_try.dot(&g_try).sqrt();
                                 let f_thresh = f_k.min(f_next) + epsF_iter;
-                                let descent_ok = g_try.dot(&present_d_k)
-                                    <= -eps_g(&g_k, &present_d_k, self.tau_g);
+                                let s_tmp = &x_try - &x_k;
+                                let descent_ok =
+                                    g_try.dot(&s_tmp) <= -eps_g(&g_proj_k, &s_tmp, self.tau_g);
                                 let f_ok = f_try <= f_thresh;
                                 let g_ok = g_try_norm <= self.grad_drop_factor.get() * gnext_norm0;
                                 if (f_ok || g_ok) && descent_ok && f_try <= best_f {
@@ -1526,11 +1561,12 @@ where
             } else {
                 self.no_improve_streak.set(0);
             }
+            let gnext_proj = self.projected_gradient(&x_next, &g_next);
             if self.no_improve_streak.get() >= self.max_no_improve {
                 return Ok(BfgsSolution {
                     final_point: x_next.clone(),
                     final_value: f_next,
-                    final_gradient_norm: g_next.dot(&g_next).sqrt(),
+                    final_gradient_norm: gnext_proj.dot(&gnext_proj).sqrt(),
                     iterations: k + 1,
                     func_evals,
                     grad_evals,
@@ -1557,8 +1593,24 @@ where
 
             let y_k = &g_next - &g_k;
 
+            let active_after = if let Some(bounds) = &self.bounds {
+                bounds.active_mask(&x_next, &g_next)
+            } else {
+                vec![false; n]
+            };
+            let mut s_update = s_k.clone();
+            let mut y_update = y_k.clone();
+            if self.bounds.is_some() {
+                for i in 0..n {
+                    if (active_before[i] && active_after[i]) || s_k[i].abs() <= 1e-14 {
+                        s_update[i] = 0.0;
+                        y_update[i] = 0.0;
+                    }
+                }
+            }
+
             // --- Cautious Hessian Update ---
-            let sy = s_k.dot(&y_k);
+            let sy = s_update.dot(&y_update);
             let mut update_status = "applied";
 
             if k == 0 {
@@ -1572,7 +1624,7 @@ where
                 b_inv = Array2::eye(n) * scale;
             } else {
                 // Powell-damped inverse BFGS update (keep SPD)
-                let s_norm = s_k.dot(&s_k).sqrt();
+                let s_norm = s_update.dot(&s_update).sqrt();
                 if s_norm > 1e-14 {
                     if !rescued {
                         // Compute H s via solving B_inv * (H s) = s
@@ -1589,8 +1641,8 @@ where
                             Lopt = chol_decompose(&binv_upd);
                         }
                         if let Some(L) = Lopt {
-                            let h_s = chol_solve(&L, &s_k);
-                            let s_h_s = s_k.dot(&h_s);
+                            let h_s = chol_solve(&L, &s_update);
+                            let s_h_s = s_update.dot(&h_s);
                             let denom_raw = s_h_s - sy;
                             let denom = if denom_raw <= 0.0 { 1e-16 } else { denom_raw };
                             let theta_raw = if sy < 0.2 * s_h_s {
@@ -1599,16 +1651,16 @@ where
                                 1.0
                             };
                             let theta = theta_raw.clamp(0.0, 1.0);
-                            let mut y_tilde = &y_k * theta + &h_s * (1.0 - theta);
-                            let mut sty = s_k.dot(&y_tilde);
+                            let mut y_tilde = &y_update * theta + &h_s * (1.0 - theta);
+                            let mut sty = s_update.dot(&y_tilde);
                             let mut y_norm = y_tilde.dot(&y_tilde).sqrt();
                             let s_norm2 = s_norm * s_norm;
                             let kappa = 1e-4;
                             let min_curv = kappa * s_norm * y_norm;
                             if sty < min_curv {
                                 let beta = (min_curv - sty) / s_norm2;
-                                y_tilde = &y_tilde + &s_k * beta;
-                                sty = s_k.dot(&y_tilde);
+                                y_tilde = &y_tilde + &s_update * beta;
+                                sty = s_update.dot(&y_tilde);
                                 y_norm = y_tilde.dot(&y_tilde).sqrt();
                             }
                             let rel = if s_norm > 0.0 && y_norm > 0.0 {
@@ -1639,11 +1691,11 @@ where
                                     right.assign(&*eye);
                                     // left -= rho_inv * s y^T; right -= rho_inv * y s^T
                                     for i in 0..n {
-                                        let si = s_k[i];
+                                        let si = s_update[i];
                                         let yi = y_tilde[i];
                                         for j in 0..n {
                                             let yj = y_tilde[j];
-                                            let sj = s_k[j];
+                                            let sj = s_update[j];
                                             left[[i, j]] -= rho_inv * si * yj;
                                             right[[i, j]] -= rho_inv * yi * sj;
                                         }
@@ -1657,7 +1709,7 @@ where
                                 // b_inv += rho_inv * s s^T
                                 for i in 0..n {
                                     for j in 0..n {
-                                        b_inv[[i, j]] += rho_inv * s_k[i] * s_k[j];
+                                        b_inv[[i, j]] += rho_inv * s_update[i] * s_update[j];
                                     }
                                 }
                                 // Validate SPD
@@ -1711,8 +1763,8 @@ where
                     }
                 }
                 if self.spd_fail_seen.get() && self.chol_fail_iters.get() >= 2 {
-                    let sy = s_k.dot(&y_k);
-                    let yy = y_k.dot(&y_k);
+                    let sy = s_update.dot(&y_update);
+                    let yy = y_update.dot(&y_update);
                     let mut lambda = if yy > 0.0 { (sy / yy).abs() } else { 1.0 };
                     lambda = lambda.clamp(1e-6, 1e6);
                     b_inv = scaled_identity(n, lambda);
@@ -1732,7 +1784,7 @@ where
             let step_ok = s_k.dot(&s_k).sqrt() <= 1e-12 * (1.0 + x_k.dot(&x_k).sqrt()) + 1e-16;
             let f_ok = (f_next - f_k).abs() <= eps_f(f_k, self.tau_f);
             let gnext_finite = f_next.is_finite() && g_next.iter().all(|v| v.is_finite());
-            let gnext_norm = g_next.dot(&g_next).sqrt();
+            let gnext_norm = gnext_proj.dot(&gnext_proj).sqrt();
             if step_ok && f_ok && gnext_finite && gnext_norm < self.tolerance {
                 let sol = BfgsSolution {
                     final_point: x_k.clone() + &s_k,
@@ -1756,7 +1808,7 @@ where
 
             // Optional stall/flat exit (relative stationarity)
             if self.stall_enable {
-                let g_inf = g_k.iter().fold(0.0, |acc, &v| f64::max(acc, v.abs()));
+                let g_inf = g_proj_k.iter().fold(0.0, |acc, &v| f64::max(acc, v.abs()));
                 let x_inf = x_k.iter().fold(0.0, |acc, &v| f64::max(acc, v.abs()));
                 let rel_g_ok = g_inf <= self.tolerance * (1.0 + x_inf);
                 let rel_f_ok = (f_k - f_last_accepted).abs() <= eps_f(f_last_accepted, self.tau_f);
@@ -1788,9 +1840,8 @@ where
             x_k = x_next;
             f_k = f_next;
             g_k = g_next;
-            if let Some(bounds) = &self.bounds {
-                active_mask = bounds.active_mask(&x_k, &g_k);
-            }
+            g_proj_k = gnext_proj;
+            active_mask = active_after;
             // Update GLL window and global best
             self.gll.borrow_mut().push(f_k);
             f_last_accepted = f_k;
@@ -1822,7 +1873,7 @@ where
         }
 
         // The loop finished. Construct a solution from the final state.
-        let final_g_norm = g_k.dot(&g_k).sqrt();
+        let final_g_norm = g_proj_k.dot(&g_proj_k).sqrt();
         let last_solution = Box::new(BfgsSolution {
             final_point: x_k,
             final_value: f_k,
@@ -1885,11 +1936,12 @@ fn line_search<ObjFn>(
 where
     ObjFn: Fn(&Array1<f64>) -> (f64, Array1<f64>),
 {
+    let g_proj_k = this.projected_gradient(x_k, g_k);
     let mut alpha_i: f64 = 1.0; // Per Nocedal & Wright, always start with a unit step.
     let mut alpha_prev = 0.0;
 
     let mut f_prev = f_k;
-    let g_k_dot_d = g_k.dot(d_k); // Initial derivative along the search direction.
+    let g_k_dot_d = g_proj_k.dot(d_k); // Initial derivative along the search direction.
     if g_k_dot_d >= 0.0 {
         log::warn!(
             "[BFGS Wolfe] Non-descent direction detected (gᵀd = {:.2e} >= 0).",
@@ -1906,6 +1958,7 @@ where
     for _ in 0..max_attempts {
         let trial = x_k + alpha_i * d_k;
         let x_new = this.project_point(&trial);
+        let kink_here = is_kink(&trial, &x_new);
         let (f_i, g_i) = obj_fn(&x_new);
         func_evals += 1;
         grad_evals += 1;
@@ -1947,14 +2000,24 @@ where
             continue;
         }
 
+        if kink_here {
+            this.global_best.borrow_mut().replace(best.clone());
+            return backtracking_line_search(this, obj_fn, x_k, d_k, f_k, g_k)
+                .map(|(a, f, g, fe, ge, kind)| (a, f, g, func_evals + fe, grad_evals + ge, kind));
+        }
+
+        let s = &x_new - x_k;
+        let gk_ts = g_k.dot(&s);
+        let g_proj_i = this.projected_gradient(&x_new, &g_i);
+        let g_i_dot_d = g_proj_i.dot(d_k);
+
         // Classic Armijo + previous worsening for bracketing (Strong-Wolfe)
-        let armijo_strict = f_i > f_k + c1 * alpha_i * g_k_dot_d + epsF;
+        let armijo_strict = f_i > f_k + c1 * gk_ts + epsF;
         let prev_worse = func_evals > 1 && f_i >= f_prev - epsF;
         if armijo_strict || prev_worse {
             // The minimum is bracketed between alpha_prev and alpha_i.
             // A non-finite gradient from a non-finite function value is handled
             // robustly by the zoom function.
-            let g_i_dot_d = g_i.dot(d_k);
             let r = zoom(
                 this,
                 obj_fn,
@@ -1980,7 +2043,6 @@ where
             return r;
         }
 
-        let g_i_dot_d = g_i.dot(d_k);
         // The curvature condition.
         if g_i_dot_d.abs() <= c2 * g_k_dot_d.abs() {
             // Strong Wolfe conditions are satisfied.
@@ -1999,7 +2061,8 @@ where
 
         // Approximate-Wolfe and gradient-reduction acceptors
         let approx_curv_ok = g_i_dot_d.abs()
-            <= c2 * g_k_dot_d.abs() + this.curv_slack_scale.get() * eps_g(g_k, d_k, this.tau_g);
+            <= c2 * g_k_dot_d.abs()
+                + this.curv_slack_scale.get() * eps_g(&g_proj_k, d_k, this.tau_g);
         let f_flat_ok = f_i <= f_k + epsF;
         if approx_curv_ok && f_flat_ok && g_i_dot_d <= 0.0 {
             this.approx_wolfe_accepts
@@ -2018,7 +2081,7 @@ where
         let drop_factor = this.grad_drop_factor.get();
         if f_flat_ok
             && gi_norm <= drop_factor * gk_norm
-            && g_i_dot_d <= -eps_g(g_k, d_k, this.tau_g)
+            && g_i_dot_d <= -eps_g(&g_proj_k, d_k, this.tau_g)
         {
             return Ok((
                 alpha_i,
@@ -2035,7 +2098,7 @@ where
             let gll = this.gll.borrow();
             if gll.is_empty() { f_k } else { gll.fmax() }
         };
-        let nonmono_ok = this.accept_nonmonotone(f_k, fmax, alpha_i, g_k_dot_d, f_i);
+        let nonmono_ok = this.accept_nonmonotone(f_k, fmax, gk_ts, f_i);
         if nonmono_ok && approx_curv_ok {
             return Ok((
                 alpha_i,
@@ -2123,7 +2186,8 @@ where
     let mut rho = 0.5;
     let max_attempts = 50;
 
-    let g_k_dot_d = g_k.dot(d_k);
+    let g_proj_k = this.projected_gradient(x_k, g_k);
+    let g_k_dot_d = g_proj_k.dot(d_k);
     // A backtracking search is only valid on a descent direction.
     if g_k_dot_d > 0.0 {
         log::warn!(
@@ -2160,11 +2224,16 @@ where
             continue;
         }
 
+        let s = &x_new - x_k;
+        let gk_ts = g_k.dot(&s);
+        let g_proj_new = this.projected_gradient(&x_new, &g_new);
+        let g_new_dot_d = g_proj_new.dot(d_k);
+
         let fmax = {
             let gll = this.gll.borrow();
             if gll.is_empty() { f_k } else { gll.fmax() }
         };
-        let armijo_accept = this.accept_nonmonotone(f_k, fmax, alpha, g_k_dot_d, f_new);
+        let armijo_accept = this.accept_nonmonotone(f_k, fmax, gk_ts, f_new);
         if f_new.is_finite() && armijo_accept {
             return Ok((
                 alpha,
@@ -2182,7 +2251,7 @@ where
         let drop_factor = this.grad_drop_factor.get();
         if f_new <= f_k + epsF
             && gnew_norm <= drop_factor * gk_norm
-            && g_new.dot(d_k) <= -eps_g(g_k, d_k, this.tau_g)
+            && g_new_dot_d <= -eps_g(&g_proj_k, d_k, this.tau_g)
         {
             return Ok((
                 alpha,
@@ -2195,10 +2264,10 @@ where
         }
 
         // Approximate curvature + flat f acceptance (parity with line_search)
-        let approx_curv_ok = g_new.dot(d_k).abs()
+        let approx_curv_ok = g_new_dot_d.abs()
             <= this.c2_adapt.get() * g_k_dot_d.abs()
-                + this.curv_slack_scale.get() * eps_g(g_k, d_k, this.tau_g);
-        if f_new <= f_k + epsF && approx_curv_ok && g_new.dot(d_k) <= 0.0 {
+                + this.curv_slack_scale.get() * eps_g(&g_proj_k, d_k, this.tau_g);
+        if f_new <= f_k + epsF && approx_curv_ok && g_new_dot_d <= 0.0 {
             return Ok((
                 alpha,
                 f_new,
@@ -2294,9 +2363,19 @@ where
     let max_zoom_attempts = 15;
     let min_alpha_step = 1e-12; // Prevents division by zero or degenerate steps.
     let epsF = eps_f(f_k, this.tau_f);
+    let g_proj_k = this.projected_gradient(x_k, g_k);
     let mut best = ProbeBest::new(x_k, f_k, g_k);
     let mut lo_deriv_known = true;
     let mut hi_deriv_known = true;
+    let raw_lo = x_k + alpha_lo * d_k;
+    let proj_lo = this.project_point(&raw_lo);
+    let raw_hi = x_k + alpha_hi * d_k;
+    let proj_hi = this.project_point(&raw_hi);
+    if is_kink(&raw_lo, &proj_lo) || is_kink(&raw_hi, &proj_hi) {
+        this.global_best.borrow_mut().replace(best.clone());
+        return backtracking_line_search(this, obj_fn, x_k, d_k, f_k, g_k)
+            .map(|(a, f, g, fe, ge, kind)| (a, f, g, func_evals + fe, grad_evals + ge, kind));
+    }
     for _ in 0..max_zoom_attempts {
         // Early exits on tiny bracket or flat ends
         if (alpha_hi - alpha_lo).abs() <= 1e-12 || (f_hi - f_lo).abs() <= epsF {
@@ -2324,6 +2403,7 @@ where
             let (f_j, g_j) = obj_fn(&x_j);
             func_evals += 1;
             grad_evals += 1;
+            best.consider(&x_j, f_j, &g_j);
             if !f_j.is_finite() || g_j.iter().any(|&v| !v.is_finite()) {
                 this.nonfinite_seen.set(true);
                 if choose_lo {
@@ -2335,21 +2415,33 @@ where
                 }
                 continue;
             }
+            let kink_j = is_kink(&trial, &x_j);
+            if kink_j {
+                this.global_best.borrow_mut().replace(best.clone());
+                return backtracking_line_search(this, obj_fn, x_k, d_k, f_k, g_k).map(
+                    |(a, f, g, fe, ge, kind)| (a, f, g, func_evals + fe, grad_evals + ge, kind),
+                );
+            }
+            let s = &x_j - x_k;
+            let gk_ts = g_k.dot(&s);
+            let g_proj_j = this.projected_gradient(&x_j, &g_j);
+            let g_j_dot_d = g_proj_j.dot(d_k);
             // Acceptance guard (use unified rules + gradient reduction)
             let fmax = {
                 let gll = this.gll.borrow();
                 if gll.is_empty() { f_k } else { gll.fmax() }
             };
-            let armijo_ok = this.accept_nonmonotone(f_k, fmax, alpha_j, g_k_dot_d, f_j);
-            let curv_ok = g_j.dot(d_k).abs()
-                <= c2 * g_k_dot_d.abs() + this.curv_slack_scale.get() * eps_g(g_k, d_k, this.tau_g);
+            let armijo_ok = this.accept_nonmonotone(f_k, fmax, gk_ts, f_j);
+            let curv_ok = g_j_dot_d.abs()
+                <= c2 * g_k_dot_d.abs()
+                    + this.curv_slack_scale.get() * eps_g(&g_proj_k, d_k, this.tau_g);
             let f_flat_ok = f_j <= f_k + epsF;
             let gj_norm = g_j.iter().fold(0.0, |acc, &v| acc + v * v).sqrt();
             let gk_norm = g_k.iter().fold(0.0, |acc, &v| acc + v * v).sqrt();
             let drop_factor = this.grad_drop_factor.get();
             let grad_reduce_ok = f_flat_ok
                 && (gj_norm <= drop_factor * gk_norm)
-                && (g_j.dot(d_k) <= -eps_g(g_k, d_k, this.tau_g));
+                && (g_j_dot_d <= -eps_g(&g_proj_k, d_k, this.tau_g));
             if armijo_ok {
                 return Ok((
                     alpha_j,
@@ -2359,7 +2451,7 @@ where
                     grad_evals,
                     AcceptKind::Nonmonotone,
                 ));
-            } else if f_flat_ok && curv_ok && g_j.dot(d_k) <= 0.0 {
+            } else if f_flat_ok && curv_ok && g_j_dot_d <= 0.0 {
                 return Ok((
                     alpha_j,
                     f_j,
@@ -2379,7 +2471,6 @@ where
                 ));
             } else {
                 // tighten bracket and continue
-                let g_j_dot_d = g_j.dot(d_k);
                 let mid = 0.5 * (alpha_lo + alpha_hi);
                 if alpha_j > mid {
                     alpha_hi = alpha_j;
@@ -2397,7 +2488,7 @@ where
         }
         let flat_f = (f_hi - f_lo).abs() <= epsF;
         let similar_slope = (g_hi_dot_d.abs() - g_lo_dot_d.abs()).abs()
-            <= this.curv_slack_scale.get() * eps_g(g_k, d_k, this.tau_g);
+            <= this.curv_slack_scale.get() * eps_g(&g_proj_k, d_k, this.tau_g);
         if flat_f && similar_slope {
             let alpha_mid = 0.5 * (alpha_lo + alpha_hi);
             let trial = x_k + alpha_mid * d_k;
@@ -2405,9 +2496,21 @@ where
             let (f_mid, g_mid) = obj_fn(&x_mid);
             func_evals += 1;
             grad_evals += 1;
+            best.consider(&x_mid, f_mid, &g_mid);
             if f_mid.is_finite() && g_mid.iter().all(|v| v.is_finite()) {
+                let kink_mid = is_kink(&trial, &x_mid);
+                if kink_mid {
+                    this.global_best.borrow_mut().replace(best.clone());
+                    return backtracking_line_search(this, obj_fn, x_k, d_k, f_k, g_k).map(
+                        |(a, f, g, fe, ge, kind)| (a, f, g, func_evals + fe, grad_evals + ge, kind),
+                    );
+                }
+                let s_mid = &x_mid - x_k;
+                let gk_ts = g_k.dot(&s_mid);
+                let g_proj_mid = this.projected_gradient(&x_mid, &g_mid);
+                let g_mid_dot_d = g_proj_mid.dot(d_k);
                 // Optional midpoint acceptance in flat, similar-slope brackets (guard with descent sign)
-                if this.accept_flat_midpoint_once && g_mid.dot(d_k) <= 0.0 {
+                if this.accept_flat_midpoint_once && g_mid_dot_d <= 0.0 {
                     return Ok((
                         alpha_mid,
                         f_mid,
@@ -2421,10 +2524,10 @@ where
                     let gll = this.gll.borrow();
                     if gll.is_empty() { f_k } else { gll.fmax() }
                 };
-                let armijo_ok = this.accept_nonmonotone(f_k, fmax, alpha_mid, g_k_dot_d, f_mid);
-                let curv_ok = g_mid.dot(d_k).abs()
+                let armijo_ok = this.accept_nonmonotone(f_k, fmax, gk_ts, f_mid);
+                let curv_ok = g_mid_dot_d.abs()
                     <= c2 * g_k_dot_d.abs()
-                        + this.curv_slack_scale.get() * eps_g(g_k, d_k, this.tau_g);
+                        + this.curv_slack_scale.get() * eps_g(&g_proj_k, d_k, this.tau_g);
                 let gdrop =
                     g_mid.dot(&g_mid).sqrt() <= this.grad_drop_factor.get() * g_k.dot(g_k).sqrt();
                 if armijo_ok && curv_ok {
@@ -2450,12 +2553,12 @@ where
                 if tighten_lo {
                     alpha_lo = alpha_mid;
                     f_lo = f_mid;
-                    g_lo_dot_d = g_mid.dot(d_k);
+                    g_lo_dot_d = g_mid_dot_d;
                     lo_deriv_known = true;
                 } else {
                     alpha_hi = alpha_mid;
                     f_hi = f_mid;
-                    g_hi_dot_d = g_mid.dot(d_k);
+                    g_hi_dot_d = g_mid_dot_d;
                     hi_deriv_known = true;
                 }
                 continue;
@@ -2553,14 +2656,26 @@ where
             continue;
         }
 
+        let kink_j = is_kink(&trial, &x_j);
+        if kink_j {
+            this.global_best.borrow_mut().replace(best.clone());
+            return backtracking_line_search(this, obj_fn, x_k, d_k, f_k, g_k)
+                .map(|(a, f, g, fe, ge, kind)| (a, f, g, func_evals + fe, grad_evals + ge, kind));
+        }
+
+        let s = &x_j - x_k;
+        let gk_ts = g_k.dot(&s);
+        let g_proj_j = this.projected_gradient(&x_j, &g_j);
+        let g_j_dot_d = g_proj_j.dot(d_k);
+
         // Check if the new point `alpha_j` satisfies the sufficient decrease condition.
         // An infinite `f_j` means the step was too large and failed the condition.
         let fmax = {
             let gll = this.gll.borrow();
             if gll.is_empty() { f_k } else { gll.fmax() }
         };
-        let armijo_ok = f_j <= f_k + c1 * alpha_j * g_k_dot_d + epsF;
-        let armijo_gll_ok = f_j <= fmax + c1 * alpha_j * g_k_dot_d + epsF;
+        let armijo_ok = f_j <= f_k + c1 * gk_ts + epsF;
+        let armijo_gll_ok = f_j <= fmax + c1 * gk_ts + epsF;
         if !f_j.is_finite() || (!armijo_ok && !armijo_gll_ok) || f_j >= f_lo - epsF {
             if !f_j.is_finite() {
                 this.nonfinite_seen.set(true);
@@ -2568,10 +2683,9 @@ where
             // The new point is not good enough, shrink the interval from the high end.
             alpha_hi = alpha_j;
             f_hi = f_j;
-            g_hi_dot_d = g_j.dot(d_k);
+            g_hi_dot_d = g_j_dot_d;
             hi_deriv_known = true;
         } else {
-            let g_j_dot_d = g_j.dot(d_k);
             // Check the curvature condition.
             if g_j_dot_d.abs() <= c2 * g_k_dot_d.abs() {
                 return Ok((
@@ -2583,7 +2697,8 @@ where
                     AcceptKind::StrongWolfe,
                 ));
             } else if g_j_dot_d.abs()
-                <= c2 * g_k_dot_d.abs() + this.curv_slack_scale.get() * eps_g(g_k, d_k, this.tau_g)
+                <= c2 * g_k_dot_d.abs()
+                    + this.curv_slack_scale.get() * eps_g(&g_proj_k, d_k, this.tau_g)
                 && f_j <= f_k + epsF
             {
                 return Ok((
@@ -2659,6 +2774,7 @@ where
     let cands = [0.2, 0.5, 0.8].map(|t| a_lo + t * (a_hi - a_lo));
     let epsF = eps_f(f_k, tau_f);
     let gk_norm = g_k.dot(g_k).sqrt();
+    let g_proj_k = this.projected_gradient(x_k, g_k);
     let mut best: Option<(f64, f64, Array1<f64>, AcceptKind)> = None;
     for &a in &cands {
         if !a.is_finite() || a <= 0.0 {
@@ -2674,7 +2790,8 @@ where
         }
         let ok_f = f <= f_k + epsF;
         let gi_norm = g.dot(&g).sqrt();
-        let dir_ok = g.dot(d_k) <= -eps_g(g_k, d_k, tau_g);
+        let g_proj = this.projected_gradient(&x, &g);
+        let dir_ok = g_proj.dot(d_k) <= -eps_g(&g_proj_k, d_k, tau_g);
         let ok_g = gi_norm <= drop_factor * gk_norm && dir_ok;
         if (ok_f || ok_g) && best.as_ref().map(|(fb, _, _, _)| f < *fb).unwrap_or(true) {
             let kind = if ok_g {
