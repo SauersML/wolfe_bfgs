@@ -92,7 +92,6 @@ fn eps_f(fk: f64, tau: f64) -> f64 {
 fn eps_g(gk: &Array1<f64>, dk: &Array1<f64>, tau: f64) -> f64 {
     tau * EPS * gk.dot(gk).sqrt() * dk.dot(dk).sqrt()
 }
-// removed unused step_small helper
 
 // Ring buffer for GLL nonmonotone Armijo (internal only)
 struct GllWindow {
@@ -834,7 +833,6 @@ where
         self.c2_adapt.set(self.c2);
         self.primary_strategy.set(LineSearchStrategy::StrongWolfe);
         self.wolfe_fail_streak.set(0);
-        // removed timed nonmonotone countdown; rely on clean-success switching only
         // Initialize trust radius from gradient scale
         let g0_norm = g_k.dot(&g_k).sqrt();
         let delta0 = if g0_norm.is_finite() && g0_norm > 0.0 {
@@ -1703,7 +1701,6 @@ where
             }
 
             // Nonmonotone stickiness countdown
-            // Removed time-based flip-back to StrongWolfe to avoid thrashing.
             // We return to StrongWolfe only after a run of clean backtracking
             // successes (handled above via `bt_clean_successes`).
         }
