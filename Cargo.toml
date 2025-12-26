@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 description = "A dense BFGS optimization algorithm in Rust, with a Strong Wolfe line search and initial Hessian scaling."
 readme = "README.md"
 documentation = "https://github.com/SauersML/"
-repository = "https://github.com/SauersML/bfgs"
+repository = "https://github.com/SauersML/wolfe_bfgs"
 keywords = ["optimization", "bfgs", "science"]
 categories = ["science", "algorithms"]
 
