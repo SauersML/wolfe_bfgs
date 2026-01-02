@@ -920,15 +920,15 @@ where
         let mut func_evals = 1;
         let mut grad_evals = 1;
 
-        debug_assert!(
+        assert!(
             matches!(self.primary_strategy.get(), LineSearchStrategy::StrongWolfe)
                 || self.wolfe_fail_streak.get() == 0
         );
         {
             let gll = self.gll.borrow();
-            debug_assert!(gll.buf.is_empty() || gll.buf.len() <= gll.cap);
+            assert!(gll.buf.is_empty() || gll.buf.len() <= gll.cap);
         }
-        debug_assert!(self.trust_radius.get().is_finite());
+        assert!(self.trust_radius.get().is_finite());
         self.wolfe_fail_streak.set(0);
         self.wolfe_clean_successes.set(0);
         self.bt_clean_successes.set(0);
@@ -1095,10 +1095,16 @@ where
                     }
                     Err(e) => {
                         // The primary strategy failed.
-                        if let LineSearchError::StepSizeTooSmall = e {
-                            // Treat as search failure; do not automatically shrink Δ here (cap may be the limiter)
+                        match e {
+                            LineSearchError::StepSizeTooSmall => {
+                                log::debug!("[BFGS] Line search failed: step size too small.");
+                            }
+                            LineSearchError::MaxAttempts(attempts) => {
+                                log::debug!(
+                                    "[BFGS] Line search failed: max attempts reached ({attempts})."
+                                );
+                            }
                         }
-
                         // Attempt fallback if the primary strategy was StrongWolfe.
                         if matches!(self.primary_strategy.get(), LineSearchStrategy::StrongWolfe) {
                             let streak = self.wolfe_fail_streak.get() + 1;
@@ -2856,7 +2862,6 @@ mod tests {
     use std::path::Path;
 
     #[derive(serde::Deserialize)]
-    #[allow(dead_code)]
     struct PythonOptResult {
         success: bool,
         final_point: Option<Vec<f64>>,
@@ -3159,6 +3164,30 @@ mod tests {
         // is acceptable due to minor, valid variations in line search implementations.
         let iter_diff = (our_res.iterations as i64 - scipy_res.iterations.unwrap() as i64).abs();
         assert_that(&iter_diff).is_less_than_or_equal_to(10);
+
+        let PythonOptResult {
+            final_value,
+            final_gradient_norm,
+            func_evals,
+            grad_evals,
+            message,
+            ..
+        } = scipy_res;
+        if let Some(value) = final_value {
+            assert!(value.is_finite());
+        }
+        if let Some(norm) = final_gradient_norm {
+            assert!(norm.is_finite());
+        }
+        if let Some(count) = func_evals {
+            assert!(count > 0);
+        }
+        if let Some(count) = grad_evals {
+            assert!(count > 0);
+        }
+        if let Some(text) = message {
+            assert!(!text.is_empty());
+        }
     }
 
     #[test]
@@ -3185,6 +3214,38 @@ mod tests {
             "Scipy optimization failed: {:?}",
             scipy_res.error
         );
+
+        let PythonOptResult {
+            final_point,
+            final_value,
+            final_gradient_norm,
+            iterations,
+            func_evals,
+            grad_evals,
+            message,
+            ..
+        } = scipy_res;
+        if let Some(point) = final_point {
+            assert_eq!(point.len(), 2);
+        }
+        if let Some(value) = final_value {
+            assert!(value.is_finite());
+        }
+        if let Some(norm) = final_gradient_norm {
+            assert!(norm.is_finite());
+        }
+        if let Some(iters) = iterations {
+            assert!(iters <= 100);
+        }
+        if let Some(count) = func_evals {
+            assert!(count > 0);
+        }
+        if let Some(count) = grad_evals {
+            assert!(count > 0);
+        }
+        if let Some(text) = message {
+            assert!(!text.is_empty());
+        }
     }
 
     // --- 4. Robustness Tests ---

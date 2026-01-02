@@ -1253,7 +1253,13 @@ fn manually_check_for_unused_variables() {
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let build_path = manifest_dir.join("shared/build.rs");
+    let shared_build = manifest_dir.join("shared/build.rs");
+    let root_build = manifest_dir.join("build.rs");
+    let build_path = if shared_build.exists() {
+        shared_build
+    } else {
+        root_build
+    };
 
     if !build_path.exists() {
         emit_stage_detail("manual lint self-check: build script source not found");
