@@ -33,6 +33,8 @@ wolfe_bfgs = "0.1.6"
 
 Here is an example of minimizing the 2D Rosenbrock function, a classic benchmark for optimization algorithms.
 
+Note: the objective function can be `FnMut`, so if you store the solver in a variable, call `run()` on a `mut` binding.
+
 ```rust
 use wolfe_bfgs::{Bfgs, BfgsSolution};
 use ndarray::{array, Array1};
@@ -112,13 +114,49 @@ match result {
 
 This crate implements a dense BFGS algorithm with an adaptive hybrid architecture. It is **not** a limited-memory (L-BFGS) implementation. The implementation is based on *Numerical Optimization* (2nd ed.) by Nocedal and Wright, with robustness extensions:
 
--   **BFGS Update**: The inverse Hessian $H_k$ is updated using the standard formula.
+-   **BFGS Update**: The inverse Hessian $H_k$ is updated to satisfy the secant condition $H_{k+1} y_k = s_k$ while preserving symmetry and positive definiteness.
 -   **Line Search (Tier 1)**: Strong Wolfe is attempted first (bracketing + `zoom` with cubic interpolation).
 -   **Fallback (Tier 2)**: If Wolfe repeatedly fails, the solver switches to Armijo backtracking with nonmonotone (GLL) acceptance and approximate-Wolfe/gradient-reduction acceptors.
 -   **Fallback (Tier 3)**: If line search fails or brackets collapse, a trust-region dogleg step is attempted.
 -   **Non-Monotone Acceptance**: The GLL window allows temporary increases in $f$ as long as the step is good relative to recent history.
 -   **Update Safeguards**: Because Armijo/backtracking does not guarantee curvature, stability is enforced via Powell damping or update skipping when $s_k^T y_k$ is insufficient.
 -   **Bounds**: When bounds are set, steps are projected and the gradient is zeroed for active constraints (projected gradient).
+
+### Mathematical Formulation
+
+The solver minimizes a scalar objective $f(x)$ by iteratively updating the point $x_k$ and an inverse Hessian approximation $H_k$:
+
+```math
+p_k = -H_k \nabla f(x_k), \quad x_{k+1} = x_k + \alpha_k p_k
+```
+
+The BFGS update enforces curvature consistency with $s_k = x_{k+1} - x_k$ and $y_k = \nabla f(x_{k+1}) - \nabla f(x_k)$:
+
+```math
+H_{k+1} = \left(I - \rho_k s_k y_k^T\right) H_k \left(I - \rho_k y_k s_k^T\right) + \rho_k s_k s_k^T
+```
+
+```math
+\rho_k = \frac{1}{y_k^T s_k}
+```
+
+Strong Wolfe conditions guide the line search by balancing sufficient decrease and curvature:
+
+```math
+f(x_k + \alpha p_k) \le f(x_k) + c_1 \alpha \nabla f(x_k)^T p_k
+```
+
+```math
+\left|\nabla f(x_k + \alpha p_k)^T p_k\right| \le c_2 \left|\nabla f(x_k)^T p_k\right|
+```
+
+When bounds are active, the algorithm works with the projected step and gradient:
+
+```math
+x_{k+1} = \Pi_{[l, u]}(x_k + \alpha_k p_k), \quad g_i = 0 \text{ if } x_i \in \{l_i, u_i\}
+```
+
+If curvature is weak ($y_k^T s_k$ too small or nonpositive), damping rescales the update to preserve a stable $H_k$ and maintain descent behavior.
 
 ## Advanced Configuration (Rescue Heuristics)
 
