@@ -1999,12 +1999,13 @@ where
     /// Scales the tolerance for the approximate curvature condition in the
     /// approximate-Wolfe check. Increasing this allows slightly negative curvature
     /// if the function decrease is strong, which can help on non-convex problems.
-    pub fn with_curvature_slack_scale(mut self, scale: f64) -> Self {
+    pub fn with_curvature_slack_scale(self, scale: f64) -> Self {
         self.core.curv_slack_scale.set(scale.clamp(0.1, 10.0));
         self
     }
 
     /// Executes the BFGS algorithm with the adaptive hybrid line search.
+    /// Requires `&mut self` to support stateful `FnMut` objectives.
     pub fn run(&mut self) -> Result<BfgsSolution, BfgsError> {
         self.core.run(&mut self.obj_fn)
     }
