@@ -124,13 +124,13 @@ This crate implements a dense BFGS algorithm with an adaptive hybrid architectur
 
 ### Mathematical Formulation
 
-Let $f(x)$ be the scalar objective and $x_k$ the current parameter vector. The gradient at $x_k$ is $\nabla f(x_k)$, and $H_k$ denotes the inverse Hessian approximation (a local curvature model). The search direction $p_k$ is the quasi-Newton step, and $\alpha_k$ is the line-search step length used to update the parameters:
+$f(x)$ is the scalar objective and $x_k$ is the current parameter vector. The gradient at $x_k$ is $\nabla f(x_k)$, and $H_k$ is the inverse Hessian approximation used as a local curvature model. The search direction $p_k$ is the quasi-Newton step, and $\alpha_k$ is the line-search step length used to update the parameters:
 
 ```math
 p_k = -H_k \nabla f(x_k), \quad x_{k+1} = x_k + \alpha_k p_k
 ```
 
-The BFGS update enforces curvature consistency using the step $s_k = x_{k+1} - x_k$ and the gradient change $y_k = \nabla f(x_{k+1}) - \nabla f(x_k)$. The scalar $\rho_k = 1 / (y_k^T s_k)$ normalizes the update, and $I$ is the identity matrix, so the new matrix maps recent gradient changes to the actual step taken:
+The BFGS update enforces curvature consistency using the step $s_k = x_{k+1} - x_k$ and the gradient change $y_k = \nabla f(x_{k+1}) - \nabla f(x_k)$. The scalar $\rho_k = 1 / (y_k^T s_k)$ normalizes the update, and $I$ is the identity matrix. Together they update $H_k$ so recent gradient changes map to the actual step taken:
 
 ```math
 H_{k+1} = \left(I - \rho_k s_k y_k^T\right) H_k \left(I - \rho_k y_k s_k^T\right) + \rho_k s_k s_k^T
@@ -140,7 +140,7 @@ H_{k+1} = \left(I - \rho_k s_k y_k^T\right) H_k \left(I - \rho_k y_k s_k^T\right
 \rho_k = \frac{1}{y_k^T s_k}
 ```
 
-Strong Wolfe conditions guide the line search by balancing sufficient decrease in $f$ and a drop in the directional derivative along $p_k$. The constants $c_1$ and $c_2$ are fixed parameters with $0 < c_1 < c_2 < 1$:
+Strong Wolfe conditions guide the line search by balancing sufficient decrease in $f$ and a drop in the directional derivative along $p_k$. The variable $\alpha$ is a candidate step length along $p_k$, and $c_1$ and $c_2$ are fixed parameters with $0 < c_1 < c_2 < 1$:
 
 ```math
 f(x_k + \alpha p_k) \le f(x_k) + c_1 \alpha \nabla f(x_k)^T p_k
