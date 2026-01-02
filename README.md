@@ -12,13 +12,13 @@ This work is a rewrite of the original `bfgs` crate by Paul Kernfeld.
 
 *   **Adaptive Hybrid Line Search**: Strong Wolfe (cubic interpolation) is the primary strategy, with automatic fallback to nonmonotone Armijo backtracking and approximate-Wolfe/gradient-reduction acceptance when Wolfe fails.
 *   **Three-Tier Failure Recovery**: Strong Wolfe -> Backtracking Armijo -> Trust-Region Dogleg when line searches break down or produce nonfinite values.
-*   **Non-Monotone Acceptance (GLL)**: Uses the Grippo-Lampariello-Lucidi condition to accept steps relative to a recent window, so `f(x_{k+1})` is not required to decrease every iteration.
-*   **Stability Safeguards**: When curvature is weak (`s^T y` not sufficiently positive), the solver applies Powell damping or skips the update to maintain a stable inverse Hessian.
+*   **Non-Monotone Acceptance (GLL)**: Uses the Grippo-Lampariello-Lucidi condition to accept steps relative to a recent window, so $f(x_{k+1})$ is not required to decrease every iteration.
+*   **Stability Safeguards**: When curvature is weak ($s^T y$ not sufficiently positive), the solver applies Powell damping or skips the update to maintain a stable inverse Hessian.
 *   **Bound-Constrained Optimization**: Optional box constraints with projected gradients and coordinate clamping.
-*   **Initial Hessian Scaling**: Implements the well-regarded scaling heuristic (Eq. 6.20 from Nocedal & Wright) to produce a well-scaled initial Hessian, often improving the rate of convergence.
+*   **Initial Hessian Scaling**: Implements the well-regarded scaling heuristic to produce a well-scaled initial Hessian, often improving the rate of convergence.
 *   **Ergonomic API**: Uses the builder pattern for clear and flexible configuration of the solver.
 *   **Robust Error Handling**: Provides descriptive errors and returns the best known solution even when the solver exits early.
-*   **Dense BFGS Implementation**: Stores the full `n x n` inverse Hessian approximation, suitable for small- to medium-scale optimization problems.
+*   **Dense BFGS Implementation**: Stores the full $n \times n$ inverse Hessian approximation, suitable for small- to medium-scale optimization problems.
 
 ## Usage
 
@@ -112,12 +112,12 @@ match result {
 
 This crate implements a dense BFGS algorithm with an adaptive hybrid architecture. It is **not** a limited-memory (L-BFGS) implementation. The implementation is based on *Numerical Optimization* (2nd ed.) by Nocedal and Wright, with robustness extensions:
 
--   **BFGS Update**: The inverse Hessian `H_k` is updated using the standard formula (Eq. 6.17).
+-   **BFGS Update**: The inverse Hessian $H_k$ is updated using the standard formula.
 -   **Line Search (Tier 1)**: Strong Wolfe is attempted first (bracketing + `zoom` with cubic interpolation).
 -   **Fallback (Tier 2)**: If Wolfe repeatedly fails, the solver switches to Armijo backtracking with nonmonotone (GLL) acceptance and approximate-Wolfe/gradient-reduction acceptors.
 -   **Fallback (Tier 3)**: If line search fails or brackets collapse, a trust-region dogleg step is attempted.
--   **Non-Monotone Acceptance**: The GLL window allows temporary increases in `f` as long as the step is good relative to recent history.
--   **Update Safeguards**: Because Armijo/backtracking does not guarantee curvature, stability is enforced via Powell damping or update skipping when `s_k^T y_k` is insufficient.
+-   **Non-Monotone Acceptance**: The GLL window allows temporary increases in $f$ as long as the step is good relative to recent history.
+-   **Update Safeguards**: Because Armijo/backtracking does not guarantee curvature, stability is enforced via Powell damping or update skipping when $s_k^T y_k$ is insufficient.
 -   **Bounds**: When bounds are set, steps are projected and the gradient is zeroed for active constraints (projected gradient).
 
 ## Advanced Configuration (Rescue Heuristics)
@@ -140,10 +140,10 @@ Use `with_bounds(lower, upper, tol)` to enable box constraints:
 
 The solver can stop for multiple reasons; common ones are:
 
-- `with_tolerance(eps)`: Converges when `||g|| < eps` (on the projected gradient when bounds are active).
-- `with_fp_tolerances(tau_f, tau_g)`: Scales floating-point error compensators so tiny improvements are not lost when `f` is large (e.g., `1e6`).
-- `with_flat_stall_exit(enable, k)`: Stops if `f` and `x` remain effectively flat for `k` consecutive iterations.
-- `with_no_improve_stop(tol_f_rel, k)`: Stops after `k` consecutive iterations without sufficient relative improvement in `f`.
+- `with_tolerance(eps)`: Converges when $\lVert g \rVert < \varepsilon$ (on the projected gradient when bounds are active).
+- `with_fp_tolerances(tau_f, tau_g)`: Scales floating-point error compensators so tiny improvements are not lost when $f$ is large (e.g., $10^6$).
+- `with_flat_stall_exit(enable, k)`: Stops if $f$ and $x$ remain effectively flat for $k$ consecutive iterations.
+- `with_no_improve_stop(tol_f_rel, k)`: Stops after $k$ consecutive iterations without sufficient relative improvement in $f$.
 
 ## Error Handling and Recovery
 
@@ -151,7 +151,7 @@ The solver can stop for multiple reasons; common ones are:
 
 - `LineSearchFailed { last_solution, ... }` and `MaxIterationsReached { last_solution }` both return a `BfgsSolution`. You can recover with `error.last_solution.final_point`.
 - `GradientIsNaN` is raised before any Hessian update to prevent polluting the inverse Hessian history.
--   **Initial Hessian**: A scaling heuristic is used to initialize the inverse Hessian before the first update (Eq. 6.20).
+-   **Initial Hessian**: A scaling heuristic is used to initialize the inverse Hessian before the first update.
 
 ## Testing and Validation
 
