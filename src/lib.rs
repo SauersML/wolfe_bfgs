@@ -2862,8 +2862,9 @@ mod tests {
     use spectral::prelude::*;
 
     // --- Test Harness: Python scipy.optimize Comparison Setup ---
-    use std::process::Command;
     use std::path::Path;
+    use std::process::Command;
+    use std::sync::OnceLock;
 
     #[derive(serde::Deserialize)]
     struct PythonOptResult {
@@ -2915,54 +2916,59 @@ mod tests {
     }
 
     fn ensure_python_deps() -> Result<String, String> {
-        let venv_python = ".venv/bin/python";
-        let python = if Path::new(venv_python).exists() {
-            venv_python.to_string()
-        } else {
-            "python3".to_string()
-        };
+        static PYTHON_PATH: OnceLock<Result<String, String>> = OnceLock::new();
+        PYTHON_PATH
+            .get_or_init(|| {
+                let venv_python = ".venv/bin/python";
+                let python = if Path::new(venv_python).exists() {
+                    venv_python.to_string()
+                } else {
+                    "python3".to_string()
+                };
 
-        let check = Command::new(&python)
-            .arg("-c")
-            .arg("import numpy, scipy")
-            .output()
-            .map_err(|e| format!("Failed to execute Python: {}", e))?;
+                let check = Command::new(&python)
+                    .arg("-c")
+                    .arg("import numpy, scipy")
+                    .output()
+                    .map_err(|e| format!("Failed to execute Python: {}", e))?;
 
-        if check.status.success() {
-            return Ok(python);
-        }
+                if check.status.success() {
+                    return Ok(python);
+                }
 
-        if python != venv_python {
-            let venv = Command::new("python3")
-                .arg("-m")
-                .arg("venv")
-                .arg(".venv")
-                .output()
-                .map_err(|e| format!("Failed to create venv: {}", e))?;
-            if !venv.status.success() {
-                return Err(format!(
-                    "Failed to create venv: {}",
-                    String::from_utf8_lossy(&venv.stderr)
-                ));
-            }
-        }
+                if python != venv_python {
+                    let venv = Command::new("python3")
+                        .arg("-m")
+                        .arg("venv")
+                        .arg(".venv")
+                        .output()
+                        .map_err(|e| format!("Failed to create venv: {}", e))?;
+                    if !venv.status.success() {
+                        return Err(format!(
+                            "Failed to create venv: {}",
+                            String::from_utf8_lossy(&venv.stderr)
+                        ));
+                    }
+                }
 
-        let install = Command::new(venv_python)
-            .arg("-m")
-            .arg("pip")
-            .arg("install")
-            .arg("numpy")
-            .arg("scipy")
-            .output()
-            .map_err(|e| format!("Failed to install numpy/scipy: {}", e))?;
-        if !install.status.success() {
-            return Err(format!(
-                "Failed to install numpy/scipy: {}",
-                String::from_utf8_lossy(&install.stderr)
-            ));
-        }
+                let install = Command::new(venv_python)
+                    .arg("-m")
+                    .arg("pip")
+                    .arg("install")
+                    .arg("numpy")
+                    .arg("scipy")
+                    .output()
+                    .map_err(|e| format!("Failed to install numpy/scipy: {}", e))?;
+                if !install.status.success() {
+                    return Err(format!(
+                        "Failed to install numpy/scipy: {}",
+                        String::from_utf8_lossy(&install.stderr)
+                    ));
+                }
 
-        Ok(venv_python.to_string())
+                Ok(venv_python.to_string())
+            })
+            .clone()
     }
 
     // --- Test Functions ---
