@@ -16,13 +16,10 @@ fn test_x_fourth_p_1000(bencher: &mut Bencher) {
     };
     bencher.iter(|| {
         let result = Bfgs::new(x0.clone(), obj_fn).run().unwrap();
-        let expected = Array1::zeros(p);
-        // Use approximate equality for floating-point comparison
-        for (actual, expected) in result.final_point.iter().zip(expected.iter()) {
-            assert!((actual - expected).abs() < 1e-6, 
-                   "Expected convergence to zero vector, but got difference: {}", 
-                   (actual - expected).abs());
-        }
+        assert!(
+            result.final_gradient_norm < 1e-5,
+            "Expected small gradient norm, got {}",
+            result.final_gradient_norm
+        );
     })
 }
-

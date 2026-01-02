@@ -74,6 +74,37 @@ struct DebugAssertCollector {
 
 static CURRENT_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
 
+fn is_word_byte(b: u8) -> bool {
+    matches!(b, b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'_')
+}
+
+fn contains_underscore_ident(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'_' {
+            let prev_ok = i == 0 || !is_word_byte(bytes[i - 1]);
+            let next_ok = i + 1 < bytes.len() && is_word_byte(bytes[i + 1]);
+            if prev_ok && next_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_underscore_ident_outside_strings(line_text: &str) -> bool {
+    if !line_text.contains('\"') {
+        return contains_underscore_ident(line_text);
+    }
+    let parts: Vec<&str> = line_text.split('\"').collect();
+    for (i, part) in parts.iter().enumerate() {
+        if i % 2 == 0 && contains_underscore_ident(part) {
+            return true;
+        }
+    }
+    false
+}
+
 fn warnings_enabled() -> bool {
     static ENABLE_WARNINGS: OnceLock<bool> = OnceLock::new();
     *ENABLE_WARNINGS.get_or_init(|| match std::env::var("BUILD_VERBOSE") {
@@ -595,22 +626,8 @@ impl Sink for ViolationCollector {
                 && !line_text.contains("*/match")
                 && !line_text.contains("*/let"));
 
-        // Check if the match is in a string literal and not part of code
-        let mut is_in_string = false;
-        if line_text.contains("\"") {
-            // More careful string detection logic
-            let parts: Vec<&str> = line_text.split('\"').collect();
-            // If the underscore variable is between quotes, it's in a string
-            for (i, part) in parts.iter().enumerate() {
-                if i % 2 == 1 && part.contains("_") {
-                    // Inside quotes
-                    is_in_string = true;
-                    break;
-                }
-            }
-        }
-
-        if is_pure_comment || is_in_string {
+        let has_outside = has_underscore_ident_outside_strings(line_text);
+        if is_pure_comment || !has_outside {
             return Ok(true); // Skip this match and continue searching
         }
 
@@ -634,18 +651,8 @@ impl Sink for DisallowedLetCollector {
                 && !line_text.contains("*/match")
                 && !line_text.contains("*/let"));
 
-        let mut is_in_string = false;
-        if line_text.contains("\"") {
-            let parts: Vec<&str> = line_text.split('\"').collect();
-            for (i, part) in parts.iter().enumerate() {
-                if i % 2 == 1 && part.contains("_") {
-                    is_in_string = true;
-                    break;
-                }
-            }
-        }
-
-        if is_pure_comment || is_in_string {
+        let has_outside = has_underscore_ident_outside_strings(line_text);
+        if is_pure_comment || !has_outside {
             return Ok(true);
         }
 

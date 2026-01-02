@@ -535,7 +535,7 @@ impl BfgsCore {
                         b_inv[[i, i]] *= 1.0 + 1e-3;
                     }
                 } else {
-                    let rho_inv = 1.0 / sty;
+                    let rho = 1.0 / sty;
                     {
                         let eye = &self.scratch_eye;
                         let left = &mut self.scratch_left;
@@ -548,8 +548,8 @@ impl BfgsCore {
                             for j in 0..n {
                                 let yj = y_tilde[j];
                                 let sj = s_tr[j];
-                                left[[i, j]] -= rho_inv * si * yj;
-                                right[[i, j]] -= rho_inv * yi * sj;
+                                left[[i, j]] -= rho * si * yj;
+                                right[[i, j]] -= rho * yi * sj;
                             }
                         }
                         let tmp = &mut self.scratch_tmp;
@@ -559,7 +559,7 @@ impl BfgsCore {
                     }
                     for i in 0..n {
                         for j in 0..n {
-                            b_inv[[i, j]] += rho_inv * s_tr[i] * s_tr[j];
+                            b_inv[[i, j]] += rho * s_tr[i] * s_tr[j];
                         }
                     }
                     // Validate SPD; revert if needed
@@ -607,6 +607,18 @@ impl BfgsCore {
             update_status = "skipped";
         }
         self.tr_fallbacks = self.tr_fallbacks + 1;
+        if let Some(bounds) = &self.bounds {
+            let active_mask = bounds.active_mask(&x_try, &g_try);
+            for i in 0..n {
+                if active_mask[i] {
+                    for j in 0..n {
+                        b_inv[[i, j]] = 0.0;
+                        b_inv[[j, i]] = 0.0;
+                    }
+                    b_inv[[i, i]] = 1.0;
+                }
+            }
+        }
         log::info!(
             "[BFGS] step accepted via {:?}; inverse update {}",
             AcceptKind::TrustRegion,
@@ -706,7 +718,7 @@ impl BfgsCore {
                 }
             }
         };
-        // z = H g solves B_inv z = g
+        // z = H^{-1} g solves B_inv z = g
         let z = chol_solve(&l, g);
         let gnorm2 = g.dot(g);
         let gHg = g.dot(&z).max(1e-16);
@@ -1560,146 +1572,144 @@ impl BfgsCore {
                 }
                 scale = scale.clamp(1e-3, 1e3);
                 b_inv = Array2::eye(n) * scale;
-            } else {
-                // Powell-damped inverse BFGS update (keep SPD)
-                let s_norm = s_k.dot(&s_k).sqrt();
-                if s_norm > 1e-14 {
-                    if !rescued {
-                        // Compute H s via solving B_inv * (H s) = s
-                        let mut binv_upd = b_inv.clone();
-                        let mut Lopt = chol_decompose(&binv_upd);
-                        if Lopt.is_none() {
-                            self.spd_fail_seen = true;
-                            let mean_diag =
-                                (0..n).map(|i| binv_upd[[i, i]].abs()).sum::<f64>() / (n as f64);
-                            let ridge = (1e-10 * mean_diag).max(1e-16);
-                            for i in 0..n {
-                                binv_upd[[i, i]] += ridge;
-                            }
-                            Lopt = chol_decompose(&binv_upd);
+            }
+
+            // Powell-damped inverse BFGS update (keep SPD)
+            let s_norm = s_k.dot(&s_k).sqrt();
+            if s_norm > 1e-14 {
+                if !rescued {
+                    // Compute H s via solving B_inv * (H s) = s
+                    let mut binv_upd = b_inv.clone();
+                    let mut Lopt = chol_decompose(&binv_upd);
+                    if Lopt.is_none() {
+                        self.spd_fail_seen = true;
+                        let mean_diag =
+                            (0..n).map(|i| binv_upd[[i, i]].abs()).sum::<f64>() / (n as f64);
+                        let ridge = (1e-10 * mean_diag).max(1e-16);
+                        for i in 0..n {
+                            binv_upd[[i, i]] += ridge;
                         }
-                        if let Some(L) = Lopt {
-                            let h_s = chol_solve(&L, &s_k);
-                            let s_h_s = s_k.dot(&h_s);
-                            let denom_raw = s_h_s - sy;
-                            let denom = if denom_raw <= 0.0 { 1e-16 } else { denom_raw };
-                            let theta_raw = if sy < 0.2 * s_h_s {
-                                (0.8 * s_h_s) / denom
-                            } else {
-                                1.0
-                            };
-                            let theta = theta_raw.clamp(0.0, 1.0);
-                            let mut y_tilde = &y_k * theta + &h_s * (1.0 - theta);
-                            let mut sty = s_k.dot(&y_tilde);
-                            let mut y_norm = y_tilde.dot(&y_tilde).sqrt();
-                            let s_norm2 = s_norm * s_norm;
-                            let kappa = 1e-4;
-                            let min_curv = kappa * s_norm * y_norm;
-                            if sty < min_curv {
-                                let beta = (min_curv - sty) / s_norm2;
-                                y_tilde = &y_tilde + &s_k * beta;
-                                sty = s_k.dot(&y_tilde);
-                                y_norm = y_tilde.dot(&y_tilde).sqrt();
+                        Lopt = chol_decompose(&binv_upd);
+                    }
+                    if let Some(L) = Lopt {
+                        let h_s = chol_solve(&L, &s_k);
+                        let s_h_s = s_k.dot(&h_s);
+                        let denom_raw = s_h_s - sy;
+                        let denom = if denom_raw <= 0.0 { 1e-16 } else { denom_raw };
+                        let theta_raw = if sy < 0.2 * s_h_s {
+                            (0.8 * s_h_s) / denom
+                        } else {
+                            1.0
+                        };
+                        let theta = theta_raw.clamp(0.0, 1.0);
+                        let mut y_tilde = &y_k * theta + &h_s * (1.0 - theta);
+                        let mut sty = s_k.dot(&y_tilde);
+                        let mut y_norm = y_tilde.dot(&y_tilde).sqrt();
+                        let s_norm2 = s_norm * s_norm;
+                        let kappa = 1e-4;
+                        let min_curv = kappa * s_norm * y_norm;
+                        if sty < min_curv {
+                            let beta = (min_curv - sty) / s_norm2;
+                            y_tilde = &y_tilde + &s_k * beta;
+                            sty = s_k.dot(&y_tilde);
+                            y_norm = y_tilde.dot(&y_tilde).sqrt();
+                        }
+                        let rel = if s_norm > 0.0 && y_norm > 0.0 {
+                            sty / (s_norm * y_norm)
+                        } else {
+                            0.0
+                        };
+                        if !sty.is_finite() || rel < 1e-8 {
+                            log::warn!(
+                                "[BFGS] s^T y_tilde non-positive/tiny; skipping update and inflating diag."
+                            );
+                            update_status = "skipped";
+                            self.chol_fail_iters = self.chol_fail_iters + 1;
+                            for i in 0..n {
+                                b_inv[[i, i]] *= 1.0 + 1e-3;
                             }
-                            let rel = if s_norm > 0.0 && y_norm > 0.0 {
-                                sty / (s_norm * y_norm)
-                            } else {
-                                0.0
-                            };
-                            if !sty.is_finite() || rel < 1e-8 {
-                                log::warn!(
-                                    "[BFGS] s^T y_tilde non-positive/tiny; skipping update and inflating diag."
-                                );
-                                update_status = "skipped";
-                                self.chol_fail_iters = self.chol_fail_iters + 1;
+                        } else {
+                            // Post-update SPD check: build candidate and revert if needed
+                            let old_binv = b_inv.clone();
+                            // Build left = I - rho * s y^T and right = I - rho * y s^T using scratch buffers
+                            let rho = 1.0 / sty;
+                            {
+                                let eye = &self.scratch_eye;
+                                let left = &mut self.scratch_left;
+                                let right = &mut self.scratch_right;
+                                // left = I
+                                left.assign(eye);
+                                right.assign(eye);
+                                // left -= rho * s y^T; right -= rho * y s^T
+                                for i in 0..n {
+                                    let si = s_k[i];
+                                    let yi = y_tilde[i];
+                                    for j in 0..n {
+                                        let yj = y_tilde[j];
+                                        let sj = s_k[j];
+                                        left[[i, j]] -= rho * si * yj;
+                                        right[[i, j]] -= rho * yi * sj;
+                                    }
+                                }
+                                // tmp = left * b_inv
+                                let tmp = &mut self.scratch_tmp;
+                                *tmp = left.dot(&b_inv);
+                                // b_inv = tmp * right
+                                b_inv = tmp.dot(right);
+                            }
+                            // b_inv += rho * s s^T
+                            for i in 0..n {
+                                for j in 0..n {
+                                    b_inv[[i, j]] += rho * s_k[i] * s_k[j];
+                                }
+                            }
+                            // Validate SPD
+                            if chol_decompose(&b_inv).is_none() {
+                                b_inv = old_binv;
+                                update_status = "reverted";
                                 for i in 0..n {
                                     b_inv[[i, i]] *= 1.0 + 1e-3;
                                 }
-                            } else {
-                                // Post-update SPD check: build candidate and revert if needed
-                                let old_binv = b_inv.clone();
-                                // Build left = I - rho * s y^T and right = I - rho * y s^T using scratch buffers
-                                let rho_inv = 1.0 / sty;
-                                {
-                                    let eye = &self.scratch_eye;
-                                    let left = &mut self.scratch_left;
-                                    let right = &mut self.scratch_right;
-                                    // left = I
-                                    left.assign(eye);
-                                    right.assign(eye);
-                                    // left -= rho_inv * s y^T; right -= rho_inv * y s^T
-                                    for i in 0..n {
-                                        let si = s_k[i];
-                                        let yi = y_tilde[i];
-                                        for j in 0..n {
-                                            let yj = y_tilde[j];
-                                            let sj = s_k[j];
-                                            left[[i, j]] -= rho_inv * si * yj;
-                                            right[[i, j]] -= rho_inv * yi * sj;
-                                        }
-                                    }
-                                    // tmp = left * b_inv
-                                    let tmp = &mut self.scratch_tmp;
-                                    *tmp = left.dot(&b_inv);
-                                    // b_inv = tmp * right
-                                    b_inv = tmp.dot(right);
-                                }
-                                // b_inv += rho_inv * s s^T
-                                for i in 0..n {
-                                    for j in 0..n {
-                                        b_inv[[i, j]] += rho_inv * s_k[i] * s_k[j];
-                                    }
-                                }
-                                // Validate SPD
-                                if chol_decompose(&b_inv).is_none() {
-                                    b_inv = old_binv;
-                                    update_status = "reverted";
-                                    for i in 0..n {
-                                        b_inv[[i, i]] *= 1.0 + 1e-3;
-                                    }
-                                }
                             }
-                        } else {
-                            self.chol_fail_iters = self.chol_fail_iters + 1;
-                            self.spd_fail_seen = true;
-                            log::warn!(
-                                "[BFGS] B_inv not SPD after ridge; skipping update this iter."
-                            );
-                            update_status = "skipped";
                         }
                     } else {
-                        log::info!(
-                            "[BFGS] Coordinate rescue used; skipping inverse update this iter."
+                        self.chol_fail_iters = self.chol_fail_iters + 1;
+                        self.spd_fail_seen = true;
+                        log::warn!(
+                            "[BFGS] B_inv not SPD after ridge; skipping update this iter."
                         );
                         update_status = "skipped";
                     }
-                    // Enforce symmetry and gentle regularization
-                    // Symmetrize in-place
-                    for i in 0..n {
-                        for j in (i + 1)..n {
-                            let a = b_inv[[i, j]];
-                            let b = b_inv[[j, i]];
-                            let v = 0.5 * (a + b);
-                            b_inv[[i, j]] = v;
-                            b_inv[[j, i]] = v;
-                        }
-                    }
-                    let mut diag_min = f64::INFINITY;
-                    for i in 0..n {
-                        diag_min = diag_min.min(b_inv[[i, i]]);
-                    }
-                    if !diag_min.is_finite() || diag_min <= 0.0 {
-                        // Simple diagonal bump proportional to trace
-                        let mut trace = 0.0;
-                        for i in 0..n {
-                            trace += b_inv[[i, i]].abs();
-                        }
-                        let delta = 1e-12 * trace.max(1.0);
-                        for i in 0..n {
-                            b_inv[[i, i]] += delta;
-                        }
+                } else {
+                    log::info!("[BFGS] Coordinate rescue used; skipping inverse update this iter.");
+                    update_status = "skipped";
+                }
+
+                // Enforce symmetry and gentle regularization
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        let a = b_inv[[i, j]];
+                        let b = b_inv[[j, i]];
+                        let v = 0.5 * (a + b);
+                        b_inv[[i, j]] = v;
+                        b_inv[[j, i]] = v;
                     }
                 }
+                let mut diag_min = f64::INFINITY;
+                for i in 0..n {
+                    diag_min = diag_min.min(b_inv[[i, i]]);
+                }
+                if !diag_min.is_finite() || diag_min <= 0.0 {
+                    let mut trace = 0.0;
+                    for i in 0..n {
+                        trace += b_inv[[i, i]].abs();
+                    }
+                    let delta = 1e-12 * trace.max(1.0);
+                    for i in 0..n {
+                        b_inv[[i, i]] += delta;
+                    }
+                }
+
                 if self.spd_fail_seen && self.chol_fail_iters >= 2 {
                     let sy = s_k.dot(&y_k);
                     let yy = y_k.dot(&y_k);
@@ -1709,6 +1719,20 @@ impl BfgsCore {
                     self.resets_count = self.resets_count + 1;
                     self.chol_fail_iters = 0;
                     update_status = "reverted";
+                }
+            } else {
+                update_status = "skipped";
+            }
+
+            if self.bounds.is_some() {
+                for i in 0..n {
+                    if active_after[i] {
+                        for j in 0..n {
+                            b_inv[[i, j]] = 0.0;
+                            b_inv[[j, i]] = 0.0;
+                        }
+                        b_inv[[i, i]] = 1.0;
+                    }
                 }
             }
 
@@ -2631,37 +2655,36 @@ where
             return Err(LineSearchError::MaxAttempts(max_zoom_attempts));
         }
         let alpha_j = {
-            // Ensure alpha_lo < alpha_hi for stable interpolation.
-            if alpha_lo > alpha_hi {
-                std::mem::swap(&mut alpha_lo, &mut alpha_hi);
-                std::mem::swap(&mut f_lo, &mut f_hi);
-                std::mem::swap(&mut g_lo_dot_d, &mut g_hi_dot_d);
-            }
+            let (alpha_lo_i, alpha_hi_i, f_lo_i, f_hi_i, g_lo_i, g_hi_i) =
+                if alpha_lo <= alpha_hi {
+                    (alpha_lo, alpha_hi, f_lo, f_hi, g_lo_dot_d, g_hi_dot_d)
+                } else {
+                    (alpha_hi, alpha_lo, f_hi, f_lo, g_hi_dot_d, g_lo_dot_d)
+                };
 
-            let alpha_diff = alpha_hi - alpha_lo;
+            let alpha_diff = alpha_hi_i - alpha_lo_i;
 
             // Fallback to bisection if the interval is too small, derivatives unknown,
             // or if function values at the interval ends are infinite, preventing unstable interpolation.
             if alpha_diff < min_alpha_step
-                || !f_lo.is_finite()
-                || !f_hi.is_finite()
+                || !f_lo_i.is_finite()
+                || !f_hi_i.is_finite()
                 || !lo_deriv_known
                 || !hi_deriv_known
             {
                 (alpha_lo + alpha_hi) / 2.0
             } else {
-                let d1 = g_lo_dot_d + g_hi_dot_d - 3.0 * (f_hi - f_lo) / alpha_diff;
-                let d2_sq = d1 * d1 - g_lo_dot_d * g_hi_dot_d;
+                let d1 = g_lo_i + g_hi_i - 3.0 * (f_hi_i - f_lo_i) / alpha_diff;
+                let d2_sq = d1 * d1 - g_lo_i * g_hi_i;
 
                 if d2_sq >= 0.0 && d2_sq.is_finite() {
                     let d2 = d2_sq.sqrt();
-                    let trial = alpha_hi
-                        - alpha_diff * (g_hi_dot_d + d2 - d1)
-                            / (g_hi_dot_d - g_lo_dot_d + 2.0 * d2);
+                    let trial = alpha_hi_i
+                        - alpha_diff * (g_hi_i + d2 - d1) / (g_hi_i - g_lo_i + 2.0 * d2);
 
                     // If interpolation gives a non-finite value or a point outside
                     // the bracket, fall back to bisection.
-                    if !trial.is_finite() || trial < alpha_lo || trial > alpha_hi {
+                    if !trial.is_finite() || trial < alpha_lo_i || trial > alpha_hi_i {
                         (alpha_lo + alpha_hi) / 2.0
                     } else {
                         trial
