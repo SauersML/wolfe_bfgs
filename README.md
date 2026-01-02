@@ -1,19 +1,23 @@
-# A Robust BFGS Implementation in Rust
+# Adaptive Hybrid BFGS in Rust
 
 [![Crates.io](https://img.shields.io/crates/v/wolfe-bfgs.svg)](https://crates.io/crates/wolfe-bfgs)
 [![Docs.rs](https://docs.rs/wolfe_bfgs/badge.svg)](https://docs.rs/wolfe_bfgs)
 [![Build Status](https://github.com/SauersML/wolfe_bfgs/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/wolfe_bfgs/actions)
 
-A pure Rust implementation of the dense BFGS optimization algorithm for unconstrained nonlinear problems. This library provides a powerful solver built upon the principles and best practices outlined in Nocedal & Wright's *Numerical Optimization*.
+A pure Rust implementation of a dense BFGS optimizer with an adaptive, fault-tolerant architecture. It is designed for messy, real-world nonlinear problems (including optional box constraints), and is built on principles from Nocedal & Wright's *Numerical Optimization* with robustness extensions.
 
 This work is a rewrite of the original `bfgs` crate by Paul Kernfeld.
 
 ## Features
 
-*   **Strong Wolfe Line Search**: Guarantees stability and positive-definiteness of the Hessian approximation by satisfying the Strong Wolfe conditions. This ensures the crucial curvature condition `s_k^T y_k > 0` holds, making the algorithm reliable even for challenging functions.
+*   **Adaptive Hybrid Line Search**: Strong Wolfe (cubic interpolation) is the primary strategy, with automatic fallback to nonmonotone Armijo backtracking and approximate-Wolfe/gradient-reduction acceptance when Wolfe fails.
+*   **Three-Tier Failure Recovery**: Strong Wolfe -> Backtracking Armijo -> Trust-Region Dogleg when line searches break down or produce nonfinite values.
+*   **Non-Monotone Acceptance (GLL)**: Uses the Grippo-Lampariello-Lucidi condition to accept steps relative to a recent window, so `f(x_{k+1})` is not required to decrease every iteration.
+*   **Stability Safeguards**: When curvature is weak (`s^T y` not sufficiently positive), the solver applies Powell damping or skips the update to maintain a stable inverse Hessian.
+*   **Bound-Constrained Optimization**: Optional box constraints with projected gradients and coordinate clamping.
 *   **Initial Hessian Scaling**: Implements the well-regarded scaling heuristic (Eq. 6.20 from Nocedal & Wright) to produce a well-scaled initial Hessian, often improving the rate of convergence.
 *   **Ergonomic API**: Uses the builder pattern for clear and flexible configuration of the solver.
-*   **Robust Error Handling**: Provides descriptive errors for common failure modes, such as line search failures or reaching the iteration limit, enabling better diagnostics.
+*   **Robust Error Handling**: Provides descriptive errors and returns the best known solution even when the solver exits early.
 *   **Dense BFGS Implementation**: Stores the full `n x n` inverse Hessian approximation, suitable for small- to medium-scale optimization problems.
 
 ## Usage
@@ -22,7 +26,7 @@ First, add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-wolfe_bfgs = "0.1.0"
+wolfe_bfgs = "0.1.6"
 ```
 
 ### Example: Minimizing the Rosenbrock Function
@@ -66,12 +70,87 @@ assert!((solution.final_point[0] - 1.0).abs() < 1e-5);
 assert!((solution.final_point[1] - 1.0).abs() < 1e-5);
 ```
 
+### Example: Robust Configuration for Messy Objectives
+
+This example shows a discretized objective (quantized `f`) that can create flat regions. The gradient comes from the underlying smooth model, and the solver is configured to handle plateaus and noisy acceptance.
+
+```rust
+use wolfe_bfgs::{Bfgs, BfgsError};
+use ndarray::{array, Array1};
+
+let messy = |x: &Array1<f64>| -> (f64, Array1<f64>) {
+    let raw = x[0] * x[0] + x[1] * x[1];
+    let f = (raw * 100.0).round() / 100.0; // quantized objective (flat regions)
+    let g = array![2.0 * x[0], 2.0 * x[1]];
+    (f, g)
+};
+
+let x0 = array![5.0, -3.0];
+let result = Bfgs::new(x0, messy)
+    .with_fp_tolerances(1e3, 1e2)
+    .with_accept_flat_midpoint_once(true)
+    .with_jiggle_on_flats(true, 1e-3)
+    .with_multi_direction_rescue(true)
+    .with_rescue_hybrid(true)
+    .with_rescue_heads(3)
+    .with_curvature_slack_scale(1.5)
+    .with_flat_stall_exit(true, 4)
+    .with_no_improve_stop(1e-7, 8)
+    .run();
+
+match result {
+    Ok(sol) => println!("Solved: f = {:.4}", sol.final_value),
+    Err(BfgsError::MaxIterationsReached { last_solution })
+    | Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
+        println!("Recovered best f = {:.4}", last_solution.final_value);
+    }
+    Err(e) => eprintln!("Failed: {e}"),
+}
+```
+
 ## Algorithm Details
 
-This crate implements the standard, dense BFGS algorithm. It is **not** a limited-memory (L-BFGS) implementation. The implementation closely follows the methods described in *Numerical Optimization* (2nd ed.) by Nocedal and Wright:
+This crate implements a dense BFGS algorithm with an adaptive hybrid architecture. It is **not** a limited-memory (L-BFGS) implementation. The implementation is based on *Numerical Optimization* (2nd ed.) by Nocedal and Wright, with robustness extensions:
 
 -   **BFGS Update**: The inverse Hessian `H_k` is updated using the standard formula (Eq. 6.17).
--   **Line Search**: A line search satisfying the Strong Wolfe conditions is implemented according to Algorithm 3.5 from the text. This involves a bracketing phase followed by a `zoom` phase (Algorithm 3.6) that uses cubic interpolation for efficient refinement.
+-   **Line Search (Tier 1)**: Strong Wolfe is attempted first (bracketing + `zoom` with cubic interpolation).
+-   **Fallback (Tier 2)**: If Wolfe repeatedly fails, the solver switches to Armijo backtracking with nonmonotone (GLL) acceptance and approximate-Wolfe/gradient-reduction acceptors.
+-   **Fallback (Tier 3)**: If line search fails or brackets collapse, a trust-region dogleg step is attempted.
+-   **Non-Monotone Acceptance**: The GLL window allows temporary increases in `f` as long as the step is good relative to recent history.
+-   **Update Safeguards**: Because Armijo/backtracking does not guarantee curvature, stability is enforced via Powell damping or update skipping when `s_k^T y_k` is insufficient.
+-   **Bounds**: When bounds are set, steps are projected and the gradient is zeroed for active constraints (projected gradient).
+
+## Advanced Configuration (Rescue Heuristics)
+
+These options are designed for noisy or flat objectives where textbook BFGS can stall:
+
+- `with_multi_direction_rescue(bool)`: After repeated flat accepts, the solver probes small coordinate steps and adopts the one that reduces gradient norm without worsening `f`. Use this on plateaus or when gradients vanish.
+- `with_jiggle_on_flats(bool, scale)`: Adds controlled stochastic noise to the backtracking step size when repeated evaluations return the same `f`. Helpful for piecewise-flat or discretized objectives.
+- `with_accept_flat_midpoint_once(bool)`: Allows the `zoom` phase to accept a midpoint when the bracket is flat and slopes are nearly identical, preventing infinite loops from floating-point noise.
+- `with_rescue_hybrid(bool)`, `with_rescue_heads(usize)`: Configure coordinate-descent rescue behavior (deterministic probing of top-gradient coordinates plus optional random probing).
+
+## Box Constraints
+
+Use `with_bounds(lower, upper, tol)` to enable box constraints:
+
+- **Projection**: Trial points are clamped to `[lower, upper]` per coordinate.
+- **Projected gradient**: Active constraints have their gradient components zeroed during search direction updates.
+
+## Termination and Tolerances
+
+The solver can stop for multiple reasons; common ones are:
+
+- `with_tolerance(eps)`: Converges when `||g|| < eps` (on the projected gradient when bounds are active).
+- `with_fp_tolerances(tau_f, tau_g)`: Scales floating-point error compensators so tiny improvements are not lost when `f` is large (e.g., `1e6`).
+- `with_flat_stall_exit(enable, k)`: Stops if `f` and `x` remain effectively flat for `k` consecutive iterations.
+- `with_no_improve_stop(tol_f_rel, k)`: Stops after `k` consecutive iterations without sufficient relative improvement in `f`.
+
+## Error Handling and Recovery
+
+`BfgsError` returns structured errors, and some variants include the best known solution:
+
+- `LineSearchFailed { last_solution, ... }` and `MaxIterationsReached { last_solution }` both return a `BfgsSolution`. You can recover with `error.last_solution.final_point`.
+- `GradientIsNaN` is raised before any Hessian update to prevent polluting the inverse Hessian history.
 -   **Initial Hessian**: A scaling heuristic is used to initialize the inverse Hessian before the first update (Eq. 6.20).
 
 ## Testing and Validation
@@ -90,7 +169,7 @@ cargo bench
 
 ## Acknowledgements
 
-This crate is a fork and rewrite of the original [bfgs](https://github.com/paulkernfeld/bfgs) crate by **Paul Kernfeld**. The new version changes the API and replaces the original grid-search-based line search with an implementation based on the Strong Wolfe conditions.
+This crate is a fork and rewrite of the original [bfgs](https://github.com/paulkernfeld/bfgs) crate by **Paul Kernfeld**. The new version changes the API and replaces the original grid-search-based line search with a Strong Wolfe primary strategy plus adaptive fallbacks.
 
 ## License
 

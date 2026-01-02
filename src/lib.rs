@@ -1,8 +1,9 @@
 //! An implementation of the BFGS optimization algorithm.
 #![allow(non_snake_case)]
 //!
-//! This crate provides a solver for unconstrained nonlinear optimization problems,
-//! built upon the principles outlined in "Numerical Optimization" by Nocedal & Wright.
+//! This crate provides a solver for nonlinear optimization problems (including optional
+//! box constraints), built upon the principles outlined in "Numerical Optimization"
+//! by Nocedal & Wright.
 //!
 //! # Features
 //! - Hybrid line search: Strong Wolfe with nonmonotone (GLL) Armijo, approximate-Wolfe, and
@@ -12,6 +13,7 @@
 //! - Epsilon-aware tolerances with configurable multipliers via `with_fp_tolerances` for rough,
 //!   piecewise-flat objectives.
 //! - Adaptive strategy switching (Wolfe <-> Backtracking) based on success streaks (no timed flips).
+//! - Optional box constraints with projected gradients and coordinate clamping.
 //! - Optional flat-bracket midpoint acceptance inside zoom (`with_accept_flat_midpoint_once`). Default: enabled.
 //! - Stochastic jiggling of step sizes on persistent flats (default ON; configurable via
 //!   `with_jiggle_on_flats`). Helps hop over repeated rank thresholds in piecewise‑flat regions.
@@ -799,6 +801,8 @@ where
     }
 
     /// Provides simple box bounds for each coordinate (lower <= x <= upper).
+    /// Points are projected by coordinate clamping, and the gradient is projected
+    /// by zeroing active constraints during direction updates.
     pub fn with_bounds(mut self, lower: Array1<f64>, upper: Array1<f64>, tol: f64) -> Self {
         assert_eq!(lower.len(), upper.len(), "lower/upper lengths differ");
         for i in 0..lower.len() {
@@ -863,28 +867,39 @@ where
         self
     }
 
+    /// Configures the coordinate-descent rescue strategy. When enabled, the solver
+    /// probes a hybrid pool that includes the top-gradient coordinates and optional
+    /// random coordinates to escape flat regions.
     pub fn with_rescue_hybrid(mut self, enable: bool) -> Self {
         self.rescue_hybrid = enable;
         self
     }
+    /// Scales the size of the coordinate-rescue probe pool relative to the problem dimension.
     pub fn with_rescue_pool_mult(mut self, pool_mult: f64) -> Self {
         self.rescue_pool_mult = pool_mult.clamp(1.0, 16.0);
         self
     }
+    /// Sets how many of the top-gradient coordinates are probed deterministically
+    /// during coordinate rescue. Higher values improve robustness at extra cost.
     pub fn with_rescue_heads(mut self, heads: usize) -> Self {
         self.rescue_heads = heads.min(8);
         self
     }
+    /// Enables stall-based termination after k consecutive flat/stalled iterations.
     pub fn with_flat_stall_exit(mut self, enable: bool, k: usize) -> Self {
         self.stall_enable = enable;
         self.stall_k = k.max(1);
         self
     }
+    /// Stops after k consecutive iterations without sufficient relative improvement in f.
     pub fn with_no_improve_stop(mut self, tol_f_rel: f64, k: usize) -> Self {
         self.tol_f_rel = tol_f_rel.max(1e-12);
         self.max_no_improve = k.max(1);
         self
     }
+    /// Scales the tolerance for the approximate curvature condition in the
+    /// approximate-Wolfe check. Increasing this allows slightly negative curvature
+    /// if the function decrease is strong, which can help on non-convex problems.
     pub fn with_curvature_slack_scale(self, scale: f64) -> Self {
         self.curv_slack_scale.set(scale.clamp(0.1, 10.0));
         self
@@ -2838,6 +2853,7 @@ mod tests {
 
     // --- Test Harness: Python scipy.optimize Comparison Setup ---
     use std::process::Command;
+    use std::path::Path;
 
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
@@ -2860,6 +2876,7 @@ mod tests {
         tolerance: f64,
         max_iterations: usize,
     ) -> Result<PythonOptResult, String> {
+        let python = ensure_python_deps()?;
         let input_json = serde_json::json!({
             "x0": x0.to_vec(),
             "function": function_name,
@@ -2867,7 +2884,7 @@ mod tests {
             "max_iterations": max_iterations
         });
 
-        let output = Command::new("python3")
+        let output = Command::new(python)
             .arg("optimization_harness.py")
             .arg(input_json.to_string())
             .current_dir(".")
@@ -2886,6 +2903,57 @@ mod tests {
 
         serde_json::from_str(&result_str)
             .map_err(|e| format!("Failed to parse Python result: {}", e))
+    }
+
+    fn ensure_python_deps() -> Result<String, String> {
+        let venv_python = ".venv/bin/python";
+        let python = if Path::new(venv_python).exists() {
+            venv_python.to_string()
+        } else {
+            "python3".to_string()
+        };
+
+        let check = Command::new(&python)
+            .arg("-c")
+            .arg("import numpy, scipy")
+            .output()
+            .map_err(|e| format!("Failed to execute Python: {}", e))?;
+
+        if check.status.success() {
+            return Ok(python);
+        }
+
+        if python != venv_python {
+            let venv = Command::new("python3")
+                .arg("-m")
+                .arg("venv")
+                .arg(".venv")
+                .output()
+                .map_err(|e| format!("Failed to create venv: {}", e))?;
+            if !venv.status.success() {
+                return Err(format!(
+                    "Failed to create venv: {}",
+                    String::from_utf8_lossy(&venv.stderr)
+                ));
+            }
+        }
+
+        let install = Command::new(venv_python)
+            .arg("-m")
+            .arg("pip")
+            .arg("install")
+            .arg("numpy")
+            .arg("scipy")
+            .output()
+            .map_err(|e| format!("Failed to install numpy/scipy: {}", e))?;
+        if !install.status.success() {
+            return Err(format!(
+                "Failed to install numpy/scipy: {}",
+                String::from_utf8_lossy(&install.stderr)
+            ));
+        }
+
+        Ok(venv_python.to_string())
     }
 
     // --- Test Functions ---
