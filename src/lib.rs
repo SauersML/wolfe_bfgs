@@ -8,8 +8,8 @@
 //! # Features
 //! - Hybrid line search: Strong Wolfe with nonmonotone (GLL) Armijo, approximate-Wolfe, and
 //!   gradient-reduction acceptors, plus a best-seen salvage path and a small probing grid.
-//! - Trust-region (dogleg) fallback with CG-based solves on the inverse Hessian, diagonal
-//!   regularization, and scaled-identity resets under severe noise.
+//! - Line-search-only strategy with resets to steepest descent and scaled-identity safeguards
+//!   under severe noise.
 //! - Epsilon-aware tolerances with configurable multipliers via `with_fp_tolerances` for rough,
 //!   piecewise-flat objectives.
 //! - Adaptive strategy switching (Wolfe <-> Backtracking) based on success streaks (no timed flips).
@@ -24,8 +24,7 @@
 //! ## Defaults (key settings)
 //! - Line search: Strong Wolfe primary; GLL nonmonotone Armijo; approximate‑Wolfe and gradient‑drop
 //!   acceptors; probing grid; keep‑best salvage.
-//! - Trust region: dogleg fallback enabled; Δ₀ = min(1, 10/||g₀||); adaptive by ρ; SPD enforcement
-//!   and scaled‑identity resets when needed.
+//! - Step radius heuristic: Δ₀ = min(1, 10/||g₀||); adaptive by step length.
 //! - Tolerances: `c1=1e-4`, `c2=0.9`; FP tolerances via `with_fp_tolerances(tau_f=1e3, tau_g=1e2)`.
 //! - Zoom midpoint: flat‑bracket midpoint acceptance (default ON; `with_accept_flat_midpoint_once`).
 //! - Stochastic jiggling: default ON with scale 1e‑3 (only after repeated flats in backtracking).
@@ -80,7 +79,7 @@
 //! assert!((x_min[1] - 1.0).abs() < 1e-5);
 //! ```
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Zip};
 use std::collections::VecDeque;
 
 // Numerical helpers and small utilities
@@ -157,56 +156,6 @@ impl ProbeBest {
 }
 
 // Conjugate gradient solve for (A + ridge*I) x = b, where A is SPD-ish.
-fn cg_solve(a: &Array2<f64>, b: &Array1<f64>, max_iter: usize, tol: f64, ridge: f64) -> Option<Array1<f64>> {
-    let n = a.nrows();
-    if a.ncols() != n || b.len() != n {
-        return None;
-    }
-    let mut x = Array1::<f64>::zeros(n);
-    let mut r = b.clone();
-    let mut p = r.clone();
-    let mut rs_old = r.dot(&r);
-    if !rs_old.is_finite() {
-        return None;
-    }
-    let b_norm = b.dot(b).sqrt().max(1.0);
-    let tol_abs = tol * b_norm;
-    for _ in 0..max_iter {
-        let mut ap = a.dot(&p);
-        if ridge > 0.0 {
-            for i in 0..n {
-                ap[i] += ridge * p[i];
-            }
-        }
-        let p_ap = p.dot(&ap);
-        if !p_ap.is_finite() || p_ap <= 0.0 {
-            return None;
-        }
-        let alpha = rs_old / p_ap;
-        if !alpha.is_finite() {
-            return None;
-        }
-        x = &x + &(alpha * &p);
-        r = &r - &(alpha * &ap);
-        let rs_new = r.dot(&r);
-        if !rs_new.is_finite() {
-            return None;
-        }
-        if rs_new.sqrt() <= tol_abs {
-            return Some(x);
-        }
-        let beta = rs_new / rs_old;
-        p = &r + &(beta * &p);
-        rs_old = rs_new;
-    }
-    Some(x)
-}
-
-// Helper: return a scaled identity matrix (lambda * I_n)
-fn scaled_identity(n: usize, lambda: f64) -> Array2<f64> {
-    Array2::<f64>::eye(n) * lambda
-}
-
 #[derive(Clone)]
 struct BoxSpec {
     lower: Array1<f64>,
@@ -276,7 +225,6 @@ enum AcceptKind {
     Nonmonotone,
     GradDrop,
     Midpoint,
-    TrustRegion,
     Rescue,
 }
 
@@ -387,15 +335,13 @@ struct BfgsCore {
     global_best: Option<ProbeBest>,
     // Diagnostics counters
     approx_wolfe_accepts: usize,
-    tr_fallback_attempts: usize,
     strategy_switches: usize,
     resets_count: usize,
     nonfinite_seen: bool,
     wolfe_clean_successes: usize,
     bt_clean_successes: usize,
     ls_failures_in_row: usize,
-    chol_fail_iters: usize,
-    spd_fail_seen: bool,
+    scratch_hy: Array1<f64>,
 }
 
 /// A configurable BFGS solver.
@@ -431,172 +377,6 @@ impl BfgsCore {
         (x_new, s, kinked)
     }
 
-    // Attempt one trust-region dogleg step. Updates trust radius and, on success,
-    // returns new (x, f, g) and updates `b_inv` cautiously. On failure, may shrink Δ.
-    fn try_trust_region_step<ObjFn>(
-        &mut self,
-        obj_fn: &mut ObjFn,
-        b_inv: &mut Array2<f64>,
-        x_k: &Array1<f64>,
-        f_k: f64,
-        g_k: &Array1<f64>,
-        func_evals: &mut usize,
-        grad_evals: &mut usize,
-    ) -> Option<(Array1<f64>, f64, Array1<f64>)>
-    where
-        ObjFn: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
-    {
-        self.tr_fallback_attempts = self.tr_fallback_attempts + 1;
-        let n = b_inv.nrows();
-        let delta = self.trust_radius;
-        let (p_tr, _) = self.trust_region_dogleg(b_inv, g_k, delta)?;
-        let raw_try = x_k + &p_tr;
-        let x_try = self.project_point(&raw_try);
-        let s_tr = &x_try - x_k;
-        let g_old = g_k.clone();
-        let (f_try, g_try) = obj_fn(&x_try);
-        *func_evals += 1;
-        *grad_evals += 1;
-        let act_dec = f_k - f_try;
-        let pred_dec = self.trust_region_predicted_decrease(b_inv, g_k, &s_tr)?;
-        if !pred_dec.is_finite() || pred_dec <= 0.0 {
-            self.trust_radius = (delta * 0.5).max(1e-12);
-            return None;
-        }
-        let rho = act_dec / pred_dec;
-        if rho > 0.75 && s_tr.dot(&s_tr).sqrt() > 0.99 * delta {
-            self.trust_radius = (delta * 2.0).min(1e6);
-        } else if rho < 0.25 {
-            self.trust_radius = (delta * 0.5).max(1e-12);
-        }
-        if rho <= 0.1 || !f_try.is_finite() || g_try.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-        // Accept TR step
-        // Update GLL window and global best
-        self.gll.push(f_try);
-        let maybe_f = self.global_best.as_ref().map(|b| b.f);
-        if let Some(bf) = maybe_f {
-            if f_try < bf - eps_f(bf, self.tau_f) {
-                self.global_best = Some(ProbeBest {
-                    f: f_try,
-                    x: x_try.clone(),
-                    g: g_try.clone(),
-                });
-            }
-        } else {
-            self.global_best = Some(ProbeBest::new(&x_try, f_try, &g_try));
-        }
-
-        // Inverse update: skip on poor model; otherwise cautious Powell-damped
-        let poor_model = rho <= 0.25;
-        let s_norm_tr = s_tr.dot(&s_tr).sqrt();
-        let mut update_status = "applied";
-        if !poor_model && s_norm_tr > 1e-14 {
-            let mean_diag = (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
-            let ridge = (1e-10 * mean_diag).max(1e-16);
-            if let Some(h_s) = cg_solve(b_inv, &s_tr, n.min(25), 1e-10, ridge) {
-                let s_h_s = s_tr.dot(&h_s);
-                let y_tr = &g_try - &g_old;
-                let sy_tr = s_tr.dot(&y_tr);
-                let denom_raw = s_h_s - sy_tr;
-                let denom = if denom_raw <= 0.0 { 1e-16 } else { denom_raw };
-                let theta_raw = if sy_tr < 0.2 * s_h_s {
-                    (0.8 * s_h_s) / denom
-                } else {
-                    1.0
-                };
-                let theta = theta_raw.clamp(0.0, 1.0);
-                let mut y_tilde = &y_tr * theta + &h_s * (1.0 - theta);
-                let mut sty = s_tr.dot(&y_tilde);
-                let mut y_norm = y_tilde.dot(&y_tilde).sqrt();
-                let kappa = 1e-4;
-                let min_curv = kappa * s_norm_tr * y_norm;
-                if sty < min_curv {
-                    let beta = (min_curv - sty) / (s_norm_tr * s_norm_tr);
-                    y_tilde = &y_tilde + &s_tr * beta;
-                    sty = s_tr.dot(&y_tilde);
-                    y_norm = y_tilde.dot(&y_tilde).sqrt();
-                }
-                let rel = if s_norm_tr > 0.0 && y_norm > 0.0 {
-                    sty / (s_norm_tr * y_norm)
-                } else {
-                    0.0
-                };
-                if !sty.is_finite() || rel < 1e-8 {
-                    update_status = "skipped";
-                    for i in 0..n {
-                        b_inv[[i, i]] *= 1.0 + 1e-3;
-                    }
-                } else {
-                    let rho = 1.0 / sty;
-                    let old_binv = b_inv.clone();
-                    let hy = old_binv.dot(&y_tilde);
-                    let y_h_y = y_tilde.dot(&hy);
-                    let coeff = (1.0 + y_h_y * rho) * rho;
-                    let mut updated = old_binv.clone();
-                    for i in 0..n {
-                        for j in 0..n {
-                            updated[[i, j]] += coeff * s_tr[i] * s_tr[j]
-                                - rho * (hy[i] * s_tr[j] + s_tr[i] * hy[j]);
-                        }
-                    }
-                    b_inv.assign(&updated);
-                    // Validate basic sanity without full factorization
-                    let mut diag_min = f64::INFINITY;
-                    for i in 0..n {
-                        diag_min = diag_min.min(b_inv[[i, i]]);
-                    }
-                    if !diag_min.is_finite() || diag_min <= 0.0 {
-                        b_inv.assign(&old_binv);
-                        for i in 0..n {
-                            b_inv[[i, i]] += 1e-6;
-                        }
-                        update_status = "reverted";
-                    }
-                }
-                // Regularize and symmetry enforce
-                for i in 0..n {
-                    for j in (i + 1)..n {
-                        let v = 0.5 * (b_inv[[i, j]] + b_inv[[j, i]]);
-                        b_inv[[i, j]] = v;
-                        b_inv[[j, i]] = v;
-                    }
-                }
-                let mut diag_min = f64::INFINITY;
-                for i in 0..n {
-                    diag_min = diag_min.min(b_inv[[i, i]]);
-                }
-                if !diag_min.is_finite() || diag_min <= 0.0 {
-                    for i in 0..n {
-                        b_inv[[i, i]] += 1e-12;
-                    }
-                }
-            } else {
-                self.spd_fail_seen = true;
-                self.chol_fail_iters = self.chol_fail_iters + 1;
-                update_status = "skipped";
-            }
-            if self.spd_fail_seen && self.chol_fail_iters >= 2 {
-                let y_tr = &g_try - &g_old;
-                let sy = s_tr.dot(&y_tr);
-                let yy = y_tr.dot(&y_tr);
-                let mut lambda = if yy > 0.0 { (sy / yy).abs() } else { 1.0 };
-                lambda = lambda.clamp(1e-6, 1e6);
-                *b_inv = scaled_identity(n, lambda);
-                self.chol_fail_iters = 0;
-                update_status = "reverted";
-            }
-        } else {
-            update_status = "skipped";
-        }
-        log::info!(
-            "[BFGS] step accepted via {:?}; inverse update {}",
-            AcceptKind::TrustRegion,
-            update_status
-        );
-        Some((x_try, f_try, g_try))
-    }
     /// Creates a new BFGS core configuration.
     pub fn new(x0: Array1<f64>) -> Self {
         Self {
@@ -634,15 +414,13 @@ impl BfgsCore {
             trust_radius: 1.0,
             global_best: None,
             approx_wolfe_accepts: 0,
-            tr_fallback_attempts: 0,
             strategy_switches: 0,
             resets_count: 0,
             nonfinite_seen: false,
             wolfe_clean_successes: 0,
             bt_clean_successes: 0,
             ls_failures_in_row: 0,
-            chol_fail_iters: 0,
-            spd_fail_seen: false,
+            scratch_hy: Array1::<f64>::zeros(0),
         }
     }
 
@@ -652,100 +430,6 @@ impl BfgsCore {
         let epsf_k = eps_f(f_k, self.tau_f);
         let epsf_max = eps_f(fmax, self.tau_f);
         (f_i <= f_k + c1 * gk_ts + epsf_k) || (f_i <= fmax + c1 * gk_ts + epsf_max)
-    }
-
-    fn trust_region_dogleg(
-        &self,
-        b_inv: &Array2<f64>,
-        g: &Array1<f64>,
-        delta: f64,
-    ) -> Option<(Array1<f64>, f64)> {
-        // Solve H z = g without full factorization (H = B_inv).
-        let n = b_inv.nrows();
-        let mean_diag = (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
-        let ridge = (1e-10 * mean_diag).max(1e-16);
-        let z = cg_solve(b_inv, g, n.min(50), 1e-10, ridge)?;
-        let gnorm2 = g.dot(g);
-        let gHg = g.dot(&z).max(1e-16);
-        // Cauchy step
-        let tau = gnorm2 / gHg;
-        let p_u = -&(g * tau);
-        // Newton/BFGS step
-        let p_b = -b_inv.dot(g);
-        let p_b_norm = p_b.dot(&p_b).sqrt();
-        if p_b_norm <= delta {
-            // predicted decrease: m(p) = g^T p + 0.5 p^T H p, with H p via solve
-            let hpb = cg_solve(b_inv, &p_b, n.min(50), 1e-10, ridge)?;
-            let pred = g.dot(&p_b) + 0.5 * p_b.dot(&hpb);
-            let pred_dec = -pred;
-            if !pred_dec.is_finite() || pred_dec <= 0.0 {
-                return None;
-            }
-            return Some((p_b, pred_dec));
-        }
-        let p_u_norm = p_u.dot(&p_u).sqrt();
-        if p_u_norm >= delta {
-            let p = -g * (delta / gnorm2.sqrt());
-            let hp = cg_solve(b_inv, &p, n.min(50), 1e-10, ridge)?;
-            let pred = g.dot(&p) + 0.5 * p.dot(&hp);
-            let pred_dec = -pred;
-            if !pred_dec.is_finite() || pred_dec <= 0.0 {
-                return None;
-            }
-            return Some((p, pred_dec));
-        }
-        // Dogleg along segment from pu to pb hitting boundary
-        let s = &p_b - &p_u;
-        let a = s.dot(&s);
-        let b = 2.0 * p_u.dot(&s);
-        let c = p_u.dot(&p_u) - delta * delta;
-        let disc = b * b - 4.0 * a * c;
-        if !disc.is_finite() || disc < 0.0 {
-            return None;
-        }
-        let sqrt_disc = disc.sqrt();
-        let t1 = (-b - sqrt_disc) / (2.0 * a);
-        let t2 = (-b + sqrt_disc) / (2.0 * a);
-        // pick valid root in (0,1); if both, choose the smaller (more conservative)
-        let mut candidates: Vec<f64> = vec![];
-        if t1.is_finite() && t1 > 0.0 && t1 < 1.0 {
-            candidates.push(t1);
-        }
-        if t2.is_finite() && t2 > 0.0 && t2 < 1.0 {
-            candidates.push(t2);
-        }
-        let t: f64 = if !candidates.is_empty() {
-            candidates.into_iter().fold(1.0, f64::min)
-        } else {
-            0.5
-        };
-        let p = &p_u + &(s * t);
-        let hp = cg_solve(b_inv, &p, n.min(50), 1e-10, ridge)?;
-        let pred = g.dot(&p) + 0.5 * p.dot(&hp);
-        let pred_dec = -pred;
-        if !pred_dec.is_finite() || pred_dec <= 0.0 {
-            return None;
-        }
-        Some((p, pred_dec))
-    }
-
-    fn trust_region_predicted_decrease(
-        &self,
-        b_inv: &Array2<f64>,
-        g: &Array1<f64>,
-        s: &Array1<f64>,
-    ) -> Option<f64> {
-        let n = b_inv.nrows();
-        let mean_diag = (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
-        let ridge = (1e-10 * mean_diag).max(1e-16);
-        let hs = cg_solve(b_inv, s, n.min(50), 1e-10, ridge)?;
-        let pred = g.dot(s) + 0.5 * s.dot(&hs);
-        let pred_dec = -pred;
-        if pred_dec.is_finite() && pred_dec > 0.0 {
-            Some(pred_dec)
-        } else {
-            None
-        }
     }
 
     fn project_point(&self, x: &Array1<f64>) -> Array1<f64> {
@@ -811,8 +495,6 @@ impl BfgsCore {
         self.bt_clean_successes = 0;
         self.ls_failures_in_row = 0;
         self.nonfinite_seen = false;
-        self.chol_fail_iters = 0;
-        self.spd_fail_seen = false;
         self.flat_accept_streak = 0;
 
         let mut b_inv = Array2::<f64>::eye(n);
@@ -835,11 +517,12 @@ impl BfgsCore {
         self.trust_radius = delta0;
 
         let mut f_last_accepted = f_k;
+        if self.scratch_hy.len() != n {
+            self.scratch_hy = Array1::<f64>::zeros(n);
+        }
         for k in 0..self.max_iterations {
             // reset per-iteration state
             self.nonfinite_seen = false;
-            self.chol_fail_iters = 0;
-            self.spd_fail_seen = false;
             g_proj_k = self.projected_gradient(&x_k, &g_k);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
             if !g_norm.is_finite() {
@@ -1056,44 +739,7 @@ impl BfgsCore {
                                         continue;
                                     }
                                 }
-                                // Try full trust-region dogleg fallback before giving up
-                                if let Some((x_new, f_new, g_new)) = self.try_trust_region_step(
-                                    obj_fn,
-                                    &mut b_inv,
-                                    &x_k,
-                                    f_k,
-                                    &g_k,
-                                    &mut func_evals,
-                                    &mut grad_evals,
-                                ) {
-                                    let g_proj_new = self.projected_gradient(&x_new, &g_new);
-                                    let rel_impr = (f_k - f_new).abs() / (1.0 + f_k.abs());
-                                    if rel_impr <= self.tol_f_rel {
-                                        self.no_improve_streak += 1;
-                                    } else {
-                                        self.no_improve_streak = 0;
-                                    }
-                                    if self.no_improve_streak >= self.max_no_improve {
-                                        return Ok(BfgsSolution {
-                                            final_point: x_new,
-                                            final_value: f_new,
-                                            final_gradient_norm: g_proj_new.dot(&g_proj_new).sqrt(),
-                                            iterations: k + 1,
-                                            func_evals,
-                                            grad_evals,
-                                        });
-                                    }
-                                    x_k = x_new;
-                                    f_k = f_new;
-                                    g_k = g_new;
-                                    g_proj_k = g_proj_new;
-                                    if let Some(bounds) = &self.bounds {
-                                        active_mask = bounds.active_mask(&x_k, &g_k);
-                                    }
-                                    self.ls_failures_in_row = 0;
-                                    continue;
-                                }
-                                self.trust_radius = (self.trust_radius * 0.7).max(1e-12);
+                                // No trust-region fallback; continue to failure handling.
                                 if self.nonfinite_seen {
                                     let mut ls = BfgsSolution {
                                         final_point: x_k.clone(),
@@ -1168,43 +814,6 @@ impl BfgsCore {
                                     } else {
                                         0
                                     };
-                                // Full trust-region dogleg fallback
-                                if let Some((x_new, f_new, g_new)) = self.try_trust_region_step(
-                                    obj_fn,
-                                    &mut b_inv,
-                                    &x_k,
-                                    f_k,
-                                    &g_k,
-                                    &mut func_evals,
-                                    &mut grad_evals,
-                                ) {
-                                    let g_proj_new = self.projected_gradient(&x_new, &g_new);
-                                    let rel_impr = (f_k - f_new).abs() / (1.0 + f_k.abs());
-                                    if rel_impr <= self.tol_f_rel {
-                                        self.no_improve_streak += 1;
-                                    } else {
-                                        self.no_improve_streak = 0;
-                                    }
-                                    if self.no_improve_streak >= self.max_no_improve {
-                                        return Ok(BfgsSolution {
-                                            final_point: x_new,
-                                            final_value: f_new,
-                                            final_gradient_norm: g_proj_new.dot(&g_proj_new).sqrt(),
-                                            iterations: k + 1,
-                                            func_evals,
-                                            grad_evals,
-                                        });
-                                    }
-                                    x_k = x_new;
-                                    f_k = f_new;
-                                    g_k = g_new;
-                                    g_proj_k = g_proj_new;
-                                    if let Some(bounds) = &self.bounds {
-                                        active_mask = bounds.active_mask(&x_k, &g_k);
-                                    }
-                                    self.ls_failures_in_row = 0;
-                                    continue;
-                                }
                                 if let Some(b) = self.global_best.as_ref() {
                                     let epsF = eps_f(f_k, self.tau_f);
                                     let gk_norm = g_proj_k.dot(&g_proj_k).sqrt();
@@ -1243,7 +852,6 @@ impl BfgsCore {
                                         continue;
                                     }
                                 }
-                                self.trust_radius = (self.trust_radius * 0.7).max(1e-12);
                                 if self.nonfinite_seen {
                                     let mut ls = BfgsSolution {
                                         final_point: x_k.clone(),
@@ -1523,83 +1131,41 @@ impl BfgsCore {
                 b_inv = Array2::eye(n) * scale;
             }
 
-            // Powell-damped inverse BFGS update (keep SPD)
+            // Inverse BFGS update (skip on weak curvature)
             let s_norm = s_k.dot(&s_k).sqrt();
             if s_norm > 1e-14 {
                 if !rescued {
-                    // Compute H^{-1} s via CG (avoid full factorization)
-                    let mean_diag =
-                        (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
-                    let ridge = (1e-10 * mean_diag).max(1e-16);
-                    if let Some(h_s) = cg_solve(&b_inv, &s_k, n.min(25), 1e-10, ridge) {
-                        let s_h_s = s_k.dot(&h_s);
-                        let denom_raw = s_h_s - sy;
-                        let denom = if denom_raw <= 0.0 { 1e-16 } else { denom_raw };
-                        let theta_raw = if sy < 0.2 * s_h_s {
-                            (0.8 * s_h_s) / denom
-                        } else {
-                            1.0
-                        };
-                        let theta = theta_raw.clamp(0.0, 1.0);
-                        let mut y_tilde = &y_k * theta + &h_s * (1.0 - theta);
-                        let mut sty = s_k.dot(&y_tilde);
-                        let mut y_norm = y_tilde.dot(&y_tilde).sqrt();
-                        let s_norm2 = s_norm * s_norm;
-                        let kappa = 1e-4;
-                        let min_curv = kappa * s_norm * y_norm;
-                        if sty < min_curv {
-                            let beta = (min_curv - sty) / s_norm2;
-                            y_tilde = &y_tilde + &s_k * beta;
-                            sty = s_k.dot(&y_tilde);
-                            y_norm = y_tilde.dot(&y_tilde).sqrt();
-                        }
-                        let rel = if s_norm > 0.0 && y_norm > 0.0 {
-                            sty / (s_norm * y_norm)
-                        } else {
-                            0.0
-                        };
-                        if !sty.is_finite() || rel < 1e-8 {
-                            log::warn!(
-                                "[BFGS] s^T y_tilde non-positive/tiny; skipping update and inflating diag."
-                            );
-                            update_status = "skipped";
-                            self.chol_fail_iters = self.chol_fail_iters + 1;
-                            for i in 0..n {
-                                b_inv[[i, i]] *= 1.0 + 1e-3;
-                            }
-                        } else {
-                            let rho = 1.0 / sty;
-                            let old_binv = b_inv.clone();
-                            let hy = old_binv.dot(&y_tilde);
-                            let y_h_y = y_tilde.dot(&hy);
-                            let coeff = (1.0 + y_h_y * rho) * rho;
-                            let mut updated = old_binv.clone();
-                            for i in 0..n {
-                                for j in 0..n {
-                                    updated[[i, j]] += coeff * s_k[i] * s_k[j]
-                                        - rho * (hy[i] * s_k[j] + s_k[i] * hy[j]);
-                                }
-                            }
-                            b_inv.assign(&updated);
-                            let mut diag_min = f64::INFINITY;
-                            for i in 0..n {
-                                diag_min = diag_min.min(b_inv[[i, i]]);
-                            }
-                            if !diag_min.is_finite() || diag_min <= 0.0 {
-                                b_inv.assign(&old_binv);
-                                for i in 0..n {
-                                    b_inv[[i, i]] += 1e-6;
-                                }
-                                update_status = "reverted";
-                            }
-                        }
-                    } else {
-                        self.chol_fail_iters = self.chol_fail_iters + 1;
-                        self.spd_fail_seen = true;
+                    let y_norm = y_k.dot(&y_k).sqrt();
+                    let kappa = 1e-4;
+                    let min_curv = kappa * s_norm * y_norm;
+                    if !sy.is_finite() || sy <= min_curv {
                         log::warn!(
-                            "[BFGS] B_inv not SPD after ridge; skipping update this iter."
+                            "[BFGS] s^T y too small; skipping update and inflating diag."
                         );
                         update_status = "skipped";
+                        for i in 0..n {
+                            b_inv[[i, i]] *= 1.0 + 1e-3;
+                        }
+                    } else {
+                        let rho = 1.0 / sy;
+                        for i in 0..n {
+                            let mut sum = 0.0;
+                            for j in 0..n {
+                                sum += b_inv[[i, j]] * y_k[j];
+                            }
+                            self.scratch_hy[i] = sum;
+                        }
+                        let y_h_y = y_k.dot(&self.scratch_hy);
+                        let coeff = (1.0 + y_h_y * rho) * rho;
+                        let s = s_k.view();
+                        let hy = self.scratch_hy.view();
+                        Zip::indexed(&mut b_inv).for_each(|(i, j), hij| {
+                            let si = s[i];
+                            let sj = s[j];
+                            let hy_i = hy[i];
+                            let hy_j = hy[j];
+                            *hij += coeff * si * sj - rho * (hy_i * sj + si * hy_j);
+                        });
                     }
                 } else {
                     log::info!("[BFGS] Coordinate rescue used; skipping inverse update this iter.");
@@ -1631,16 +1197,6 @@ impl BfgsCore {
                     }
                 }
 
-                if self.spd_fail_seen && self.chol_fail_iters >= 2 {
-                    let sy = s_k.dot(&y_k);
-                    let yy = y_k.dot(&y_k);
-                    let mut lambda = if yy > 0.0 { (sy / yy).abs() } else { 1.0 };
-                    lambda = lambda.clamp(1e-6, 1e6);
-                    b_inv = scaled_identity(n, lambda);
-                    self.resets_count = self.resets_count + 1;
-                    self.chol_fail_iters = 0;
-                    update_status = "reverted";
-                }
             } else {
                 update_status = "skipped";
             }
@@ -3348,40 +2904,6 @@ mod tests {
         let x0 = array![10.0]; // Start far from the wall and minimum.
         let result = Bfgs::new(x0, wall_with_minimum).run();
         assert!(result.is_ok() || matches!(result, Err(BfgsError::MaxIterationsReached { .. })));
-    }
-
-    #[test]
-    fn test_trust_region_projection_uses_actual_step() {
-        let x0 = array![0.9];
-        let lower = array![0.0];
-        let upper = array![1.0];
-        let mut core = super::BfgsCore::new(x0.clone());
-        core.bounds = Some(super::BoxSpec::new(lower, upper, 1e-8));
-        core.trust_radius = 10.0;
-        let mut obj = |x: &Array1<f64>| {
-            let f = (x[0] - 2.0).powi(2);
-            let g = array![2.0 * (x[0] - 2.0)];
-            (f, g)
-        };
-        let x_k = core.project_point(&x0);
-        let (f_k, g_k) = obj(&x_k);
-        let mut b_inv = Array2::eye(1);
-        let mut func_evals = 0;
-        let mut grad_evals = 0;
-        let res = core.try_trust_region_step(
-            &mut obj,
-            &mut b_inv,
-            &x_k,
-            f_k,
-            &g_k,
-            &mut func_evals,
-            &mut grad_evals,
-        );
-        assert!(res.is_some());
-        let (x_new, f_new, g_new) = res.unwrap();
-        assert!((x_new[0] - 1.0).abs() < 1e-12);
-        assert!(f_new.is_finite());
-        assert!(g_new[0].is_finite());
     }
 
     #[test]
