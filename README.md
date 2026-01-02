@@ -124,13 +124,13 @@ This crate implements a dense BFGS algorithm with an adaptive hybrid architectur
 
 ### Mathematical Formulation
 
-The solver minimizes a scalar objective $f(x)$ by iteratively updating the parameter vector $x_k$ and an inverse Hessian approximation $H_k$ (a local curvature model). The search direction $p_k$ is a quasi-Newton step that rescales the gradient to account for curvature:
+Let $f(x)$ be the scalar objective and $x_k$ the current parameter vector. The gradient at $x_k$ is $\nabla f(x_k)$, and $H_k$ denotes the inverse Hessian approximation (a local curvature model). The search direction $p_k$ is the quasi-Newton step, and $\alpha_k$ is the line-search step length used to update the parameters:
 
 ```math
 p_k = -H_k \nabla f(x_k), \quad x_{k+1} = x_k + \alpha_k p_k
 ```
 
-The BFGS update enforces curvature consistency using the step $s_k = x_{k+1} - x_k$ and gradient change $y_k = \nabla f(x_{k+1}) - \nabla f(x_k)$, so the new matrix maps recent gradient changes to the actual step taken:
+The BFGS update enforces curvature consistency using the step $s_k = x_{k+1} - x_k$ and the gradient change $y_k = \nabla f(x_{k+1}) - \nabla f(x_k)$. The scalar $\rho_k = 1 / (y_k^T s_k)$ normalizes the update, and $I$ is the identity matrix, so the new matrix maps recent gradient changes to the actual step taken:
 
 ```math
 H_{k+1} = \left(I - \rho_k s_k y_k^T\right) H_k \left(I - \rho_k y_k s_k^T\right) + \rho_k s_k s_k^T
@@ -140,7 +140,7 @@ H_{k+1} = \left(I - \rho_k s_k y_k^T\right) H_k \left(I - \rho_k y_k s_k^T\right
 \rho_k = \frac{1}{y_k^T s_k}
 ```
 
-Strong Wolfe conditions guide the line search by balancing sufficient decrease in $f$ and a drop in directional derivative along $p_k$ (preventing steps that are too short or too long):
+Strong Wolfe conditions guide the line search by balancing sufficient decrease in $f$ and a drop in the directional derivative along $p_k$. The constants $c_1$ and $c_2$ are fixed parameters with $0 < c_1 < c_2 < 1$:
 
 ```math
 f(x_k + \alpha p_k) \le f(x_k) + c_1 \alpha \nabla f(x_k)^T p_k
@@ -150,7 +150,7 @@ f(x_k + \alpha p_k) \le f(x_k) + c_1 \alpha \nabla f(x_k)^T p_k
 \left|\nabla f(x_k + \alpha p_k)^T p_k\right| \le c_2 \left|\nabla f(x_k)^T p_k\right|
 ```
 
-When bounds are active, the algorithm works with a projected step so $x$ stays inside the box constraints $[l, u]$, and the projected gradient zeroes components pinned at a bound:
+When bounds are active, the lower and upper limits are $l$ and $u$, and $\Pi_{[l, u]}(\cdot)$ projects a point into the box. The projected gradient components $g_i$ are set to zero when a coordinate $x_i$ is clamped at its bound:
 
 ```math
 x_{k+1} = \Pi_{[l, u]}(x_k + \alpha_k p_k), \quad g_i = 0 \text{ if } x_i \in \{l_i, u_i\}
