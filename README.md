@@ -1,4 +1,4 @@
-# Adaptive Hybrid BFGS in Rust
+# Adaptive BFGS in Rust
 
 [![Crates.io](https://img.shields.io/crates/v/wolfe-bfgs.svg)](https://crates.io/crates/wolfe-bfgs)
 [![Docs.rs](https://docs.rs/wolfe_bfgs/badge.svg)](https://docs.rs/wolfe_bfgs)
