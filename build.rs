@@ -1117,10 +1117,15 @@ fn main() {
         println!("cargo:rustc-env=GNOMON_RELEASE_TAG={}", release_tag);
     }
 
-    // Skip lint checks during release builds or cross-compilation
+    // Skip lint checks during release builds, cross-compilation, or docs.rs builds
     // (the grep crate won't be available in target deps during cross-compile)
     if std::env::var("GNOMON_SKIP_LINT_CHECKS").is_ok() {
         update_stage("skipping lint checks (GNOMON_SKIP_LINT_CHECKS set)");
+        return;
+    }
+
+    if std::env::var("DOCS_RS").is_ok() {
+        update_stage("skipping lint checks (docs.rs build)");
         return;
     }
 
