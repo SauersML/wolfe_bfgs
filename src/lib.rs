@@ -156,8 +156,14 @@ impl ProbeBest {
     }
 }
 
-// Conjugate gradient solve for (A + ridge*I) x = b, where A is SPD-ish.
-fn cg_solve(a: &Array2<f64>, b: &Array1<f64>, max_iter: usize, tol: f64, ridge: f64) -> Option<Array1<f64>> {
+// Conjugate gradient solve for (A + ridge*I) x = b; avoids dense factorizations.
+fn cg_solve(
+    a: &Array2<f64>,
+    b: &Array1<f64>,
+    max_iter: usize,
+    tol: f64,
+    ridge: f64,
+) -> Option<Array1<f64>> {
     let n = a.nrows();
     if a.ncols() != n || b.len() != n {
         return None;
@@ -202,11 +208,12 @@ fn cg_solve(a: &Array2<f64>, b: &Array1<f64>, max_iter: usize, tol: f64, ridge: 
     Some(x)
 }
 
-// Helper: return a scaled identity matrix (lambda * I_n)
+// Helper: return a scaled identity matrix (lambda * I_n).
 fn scaled_identity(n: usize, lambda: f64) -> Array2<f64> {
     Array2::<f64>::eye(n) * lambda
 }
 
+// Box constraints with projection and active-set tolerance.
 #[derive(Clone)]
 struct BoxSpec {
     lower: Array1<f64>,
@@ -387,13 +394,13 @@ struct BfgsCore {
     global_best: Option<ProbeBest>,
     // Diagnostics counters
     approx_wolfe_accepts: usize,
-    tr_fallback_attempts: usize,
     strategy_switches: usize,
     resets_count: usize,
     nonfinite_seen: bool,
     wolfe_clean_successes: usize,
     bt_clean_successes: usize,
     ls_failures_in_row: usize,
+    tr_fallback_attempts: usize,
     chol_fail_iters: usize,
     spd_fail_seen: bool,
 }
@@ -488,13 +495,14 @@ impl BfgsCore {
             self.global_best = Some(ProbeBest::new(&x_try, f_try, &g_try));
         }
 
-        // Inverse update: skip on poor model; otherwise cautious Powell-damped
+        // Inverse update: skip on poor model; otherwise cautious Powell-damped.
         let poor_model = rho <= 0.25;
         let s_norm_tr = s_tr.dot(&s_tr).sqrt();
         let mut update_status = "applied";
         if !poor_model && s_norm_tr > 1e-14 {
             let mean_diag = (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
             let ridge = (1e-10 * mean_diag).max(1e-16);
+            // Compute B s via CG on H (since H = B^{-1}) for Powell damping.
             if let Some(h_s) = cg_solve(b_inv, &s_tr, n.min(25), 1e-10, ridge) {
                 let s_h_s = s_tr.dot(&h_s);
                 let y_tr = &g_try - &g_old;
@@ -555,7 +563,7 @@ impl BfgsCore {
                         update_status = "reverted";
                     }
                 }
-                // Regularize and symmetry enforce
+                // Regularize and enforce symmetry to counter drift.
                 for i in 0..n {
                     for j in (i + 1)..n {
                         let v = 0.5 * (b_inv[[i, j]] + b_inv[[j, i]]);
@@ -597,6 +605,7 @@ impl BfgsCore {
         );
         Some((x_try, f_try, g_try))
     }
+
     /// Creates a new BFGS core configuration.
     pub fn new(x0: Array1<f64>) -> Self {
         Self {
@@ -634,13 +643,13 @@ impl BfgsCore {
             trust_radius: 1.0,
             global_best: None,
             approx_wolfe_accepts: 0,
-            tr_fallback_attempts: 0,
             strategy_switches: 0,
             resets_count: 0,
             nonfinite_seen: false,
             wolfe_clean_successes: 0,
             bt_clean_successes: 0,
             ls_failures_in_row: 0,
+            tr_fallback_attempts: 0,
             chol_fail_iters: 0,
             spd_fail_seen: false,
         }
@@ -694,7 +703,7 @@ impl BfgsCore {
             }
             return Some((p, pred_dec));
         }
-        // Dogleg along segment from pu to pb hitting boundary
+        // Dogleg along segment from pu to pb hitting boundary.
         let s = &p_b - &p_u;
         let a = s.dot(&s);
         let b = 2.0 * p_u.dot(&s);
@@ -719,7 +728,11 @@ impl BfgsCore {
         } else {
             0.5
         };
-        let p = &p_u + &(s * t);
+        let mut p = &p_u + &(s * t);
+        let p_norm = p.dot(&p).sqrt();
+        if p_norm.is_finite() && p_norm > delta && delta.is_finite() && delta > 0.0 {
+            p = p * (delta / p_norm);
+        }
         let hp = cg_solve(b_inv, &p, n.min(50), 1e-10, ridge)?;
         let pred = g.dot(&p) + 0.5 * p.dot(&hp);
         let pred_dec = -pred;
@@ -1523,11 +1536,11 @@ impl BfgsCore {
                 b_inv = Array2::eye(n) * scale;
             }
 
-            // Powell-damped inverse BFGS update (keep SPD)
+            // Powell-damped inverse BFGS update (keep SPD).
             let s_norm = s_k.dot(&s_k).sqrt();
             if s_norm > 1e-14 {
                 if !rescued {
-                    // Compute H^{-1} s via CG (avoid full factorization)
+                    // Compute B s via CG on H (since H = B^{-1}) for Powell damping.
                     let mean_diag =
                         (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
                     let ridge = (1e-10 * mean_diag).max(1e-16);

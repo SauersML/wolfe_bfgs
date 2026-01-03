@@ -117,7 +117,6 @@ This crate implements a dense BFGS algorithm with an adaptive hybrid architectur
 -   **BFGS Update**: The inverse Hessian $H_k$ is updated to satisfy the secant condition $H_{k+1} y_k = s_k$ while preserving symmetry and positive definiteness.
 -   **Line Search (Tier 1)**: Strong Wolfe is attempted first (bracketing + `zoom` with cubic interpolation).
 -   **Fallback (Tier 2)**: If Wolfe repeatedly fails, the solver switches to Armijo backtracking with nonmonotone (GLL) acceptance and approximate-Wolfe/gradient-reduction acceptors.
--   **Fallback (Tier 3)**: If line search fails or brackets collapse, a trust-region dogleg step is attempted using CG-based solves on the inverse Hessian.
 -   **Non-Monotone Acceptance**: The GLL window allows temporary increases in $f$ as long as the step is good relative to recent history.
 -   **Update Safeguards**: Because Armijo/backtracking does not guarantee curvature, stability is enforced via Powell damping or update skipping when $s_k^T y_k$ is insufficient.
 -   **Bounds**: When bounds are set, steps are projected and the gradient is zeroed for active constraints (projected gradient).
@@ -216,3 +215,4 @@ Licensed under either of:
 - MIT license (http://opensource.org/licenses/MIT)
 
 at your option.
+-   **Fallback (Tier 3)**: If line search fails or brackets collapse, a trust-region dogleg step is attempted using CG-based solves on the inverse Hessian.
