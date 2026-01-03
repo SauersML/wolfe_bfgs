@@ -208,6 +208,17 @@ fn cg_solve(
     Some(x)
 }
 
+// Adaptive CG iteration cap: full solve for small n, capped growth for large n.
+fn cg_iter_cap(n: usize, base: usize) -> usize {
+    let full_solve_n = 128usize;
+    let cap = 200usize;
+    if n <= full_solve_n {
+        n.max(1)
+    } else {
+        n.min(cap).max(base)
+    }
+}
+
 // Helper: return a scaled identity matrix (lambda * I_n).
 fn scaled_identity(n: usize, lambda: f64) -> Array2<f64> {
     Array2::<f64>::eye(n) * lambda
@@ -503,7 +514,7 @@ impl BfgsCore {
             let mean_diag = (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
             let ridge = (1e-10 * mean_diag).max(1e-16);
             // Compute B s via CG on H (since H = B^{-1}) for Powell damping.
-            if let Some(h_s) = cg_solve(b_inv, &s_tr, n.min(25), 1e-10, ridge) {
+            if let Some(h_s) = cg_solve(b_inv, &s_tr, cg_iter_cap(n, 25), 1e-10, ridge) {
                 let s_h_s = s_tr.dot(&h_s);
                 let y_tr = &g_try - &g_old;
                 let sy_tr = s_tr.dot(&y_tr);
@@ -673,7 +684,7 @@ impl BfgsCore {
         let n = b_inv.nrows();
         let mean_diag = (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
         let ridge = (1e-10 * mean_diag).max(1e-16);
-        let z = cg_solve(b_inv, g, n.min(50), 1e-10, ridge)?;
+        let z = cg_solve(b_inv, g, cg_iter_cap(n, 50), 1e-10, ridge)?;
         let gnorm2 = g.dot(g);
         let gHg = g.dot(&z).max(1e-16);
         // Cauchy step
@@ -684,7 +695,8 @@ impl BfgsCore {
         let p_b_norm = p_b.dot(&p_b).sqrt();
         if p_b_norm <= delta {
             // predicted decrease: m(p) = g^T p + 0.5 p^T H p, with H p via solve
-            let hpb = cg_solve(b_inv, &p_b, n.min(50), 1e-10, ridge)?;
+            // Since p_b = -H g, we have B p_b = -g for the quadratic model.
+            let hpb = -g;
             let pred = g.dot(&p_b) + 0.5 * p_b.dot(&hpb);
             let pred_dec = -pred;
             if !pred_dec.is_finite() || pred_dec <= 0.0 {
@@ -695,7 +707,7 @@ impl BfgsCore {
         let p_u_norm = p_u.dot(&p_u).sqrt();
         if p_u_norm >= delta {
             let p = -g * (delta / gnorm2.sqrt());
-            let hp = cg_solve(b_inv, &p, n.min(50), 1e-10, ridge)?;
+            let hp = cg_solve(b_inv, &p, cg_iter_cap(n, 50), 1e-10, ridge)?;
             let pred = g.dot(&p) + 0.5 * p.dot(&hp);
             let pred_dec = -pred;
             if !pred_dec.is_finite() || pred_dec <= 0.0 {
@@ -733,7 +745,7 @@ impl BfgsCore {
         if p_norm.is_finite() && p_norm > delta && delta.is_finite() && delta > 0.0 {
             p = p * (delta / p_norm);
         }
-        let hp = cg_solve(b_inv, &p, n.min(50), 1e-10, ridge)?;
+        let hp = cg_solve(b_inv, &p, cg_iter_cap(n, 50), 1e-10, ridge)?;
         let pred = g.dot(&p) + 0.5 * p.dot(&hp);
         let pred_dec = -pred;
         if !pred_dec.is_finite() || pred_dec <= 0.0 {
@@ -751,7 +763,7 @@ impl BfgsCore {
         let n = b_inv.nrows();
         let mean_diag = (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
         let ridge = (1e-10 * mean_diag).max(1e-16);
-        let hs = cg_solve(b_inv, s, n.min(50), 1e-10, ridge)?;
+        let hs = cg_solve(b_inv, s, cg_iter_cap(n, 50), 1e-10, ridge)?;
         let pred = g.dot(s) + 0.5 * s.dot(&hs);
         let pred_dec = -pred;
         if pred_dec.is_finite() && pred_dec > 0.0 {
@@ -1544,7 +1556,8 @@ impl BfgsCore {
                     let mean_diag =
                         (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
                     let ridge = (1e-10 * mean_diag).max(1e-16);
-                    if let Some(h_s) = cg_solve(&b_inv, &s_k, n.min(25), 1e-10, ridge) {
+                    if let Some(h_s) = cg_solve(&b_inv, &s_k, cg_iter_cap(n, 25), 1e-10, ridge)
+                    {
                         let s_h_s = s_k.dot(&h_s);
                         let denom_raw = s_h_s - sy;
                         let denom = if denom_raw <= 0.0 { 1e-16 } else { denom_raw };
