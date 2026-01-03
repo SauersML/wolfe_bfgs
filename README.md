@@ -11,7 +11,7 @@ This work is a rewrite of the original `bfgs` crate by Paul Kernfeld.
 ## Features
 
 *   **Adaptive Hybrid Line Search**: Strong Wolfe (cubic interpolation) is the primary strategy, with automatic fallback to nonmonotone Armijo backtracking and approximate-Wolfe/gradient-reduction acceptance when Wolfe fails. The probing grid uses the same nonmonotone/gradient-drop criteria.
-*   **Two-Tier Failure Recovery**: Strong Wolfe -> Backtracking Armijo when line searches break down or produce nonfinite values.
+*   **Three-Tier Failure Recovery**: Strong Wolfe -> Backtracking Armijo -> Trust-Region Dogleg when line searches break down or produce nonfinite values.
 *   **Non-Monotone Acceptance (GLL)**: Uses the Grippo-Lampariello-Lucidi condition to accept steps relative to a recent window, so $f(x_{k+1})$ is not required to decrease every iteration.
 *   **Stability Safeguards**: When curvature is weak ($s^T y$ not sufficiently positive), the solver applies Powell damping or skips the update to maintain a stable inverse Hessian.
 *   **Bound-Constrained Optimization**: Optional box constraints with projected gradients and coordinate clamping.
@@ -215,3 +215,4 @@ Licensed under either of:
 - MIT license (http://opensource.org/licenses/MIT)
 
 at your option.
+-   **Fallback (Tier 3)**: If line search fails or brackets collapse, a trust-region dogleg step is attempted using CG-based solves on the inverse Hessian.
