@@ -1,5 +1,5 @@
-//! An implementation of the BFGS optimization algorithm.
 #![allow(non_snake_case)]
+//! An implementation of the BFGS optimization algorithm.
 //!
 //! This crate provides a solver for nonlinear optimization problems (including optional
 //! box constraints), built upon the principles outlined in "Numerical Optimization"
@@ -71,8 +71,8 @@
 //!     .expect("BFGS failed to solve");
 //!
 //! println!(
-//!     "Found minimum f({}) = {:.4} in {} iterations.",
-//!     x_min, final_value, iterations
+//!     "Found minimum f([{:.3}, {:.3}]) = {:.4} in {} iterations.",
+//!     x_min[0], x_min[1], final_value, iterations
 //! );
 //!
 //! // The known minimum is at [1.0, 1.0].

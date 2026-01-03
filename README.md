@@ -33,7 +33,7 @@ wolfe_bfgs = "0.2.0"
 
 Here is an example of minimizing the 2D Rosenbrock function, a classic benchmark for optimization algorithms.
 
-Note: the objective function can be `FnMut`, so if you store the solver in a variable, call `run()` on a `mut` binding.
+Note: the objective function can be `FnMut`, so if you store the solver in a variable, call `run()` on a `mut` binding (e.g., `let mut solver = Bfgs::new(...); solver.run();`).
 
 ```rust
 use wolfe_bfgs::{Bfgs, BfgsSolution};
@@ -63,8 +63,11 @@ let solution = Bfgs::new(x0, rosenbrock)
     .expect("BFGS failed to solve");
 
 println!(
-    "Found minimum f({:.3}) = {:.4} in {} iterations.",
-    solution.final_point, solution.final_value, solution.iterations
+    "Found minimum f([{:.3}, {:.3}]) = {:.4} in {} iterations.",
+    solution.final_point[0],
+    solution.final_point[1],
+    solution.final_value,
+    solution.iterations
 );
 
 // The known minimum is at [1.0, 1.0].
@@ -150,10 +153,11 @@ f(x_k + \alpha p_k) \le f(x_k) + c_1 \alpha \nabla f(x_k)^T p_k
 \left|\nabla f(x_k + \alpha p_k)^T p_k\right| \le c_2 \left|\nabla f(x_k)^T p_k\right|
 ```
 
-When bounds are active, the lower and upper limits are $l$ and $u$, and $\Pi_{[l, u]}(\cdot)$ projects a point into the box. The projected gradient components $g_i$ are set to zero when a coordinate $x_i$ is clamped at its bound:
+When bounds are active, the lower and upper limits are $l$ and $u$, and $\Pi_{[l, u]}(\cdot)$ projects a point into the box. The projected gradient components $g_i$ are set to zero when a coordinate $x_i$ is at a bound and the gradient points outward:
 
 ```math
-x_{k+1} = \Pi_{[l, u]}(x_k + \alpha_k p_k), \quad g_i = 0 \text{ if } x_i \in \{l_i, u_i\}
+x_{k+1} = \Pi_{[l, u]}(x_k + \alpha_k p_k), \quad
+g_i = 0 \text{ if } (x_i = l_i \land g_i \ge 0) \text{ or } (x_i = u_i \land g_i \le 0)
 ```
 
 If curvature is weak (the inner product $y_k^T s_k$ is too small or nonpositive), damping rescales the update to preserve a stable $H_k$ and maintain descent behavior.
@@ -166,6 +170,7 @@ These options are designed for noisy or flat objectives where textbook BFGS can 
 - `with_jiggle_on_flats(bool, scale)`: Adds controlled stochastic noise to the backtracking step size when repeated evaluations return the same `f`. Helpful for piecewise-flat or discretized objectives.
 - `with_accept_flat_midpoint_once(bool)`: Allows the `zoom` phase to accept a midpoint when the bracket is flat and slopes are nearly identical, preventing infinite loops from floating-point noise.
 - `with_rescue_hybrid(bool)`, `with_rescue_heads(usize)`: Configure coordinate-descent rescue behavior (deterministic probing of top-gradient coordinates plus optional random probing).
+- `with_curvature_slack_scale(scale)`: Scales the curvature slack used in line-search acceptance tests; higher values are more permissive on noisy objectives.
 
 ## Box Constraints
 
