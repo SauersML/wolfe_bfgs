@@ -514,11 +514,22 @@ impl BfgsCore {
         *grad_evals += 1;
         let act_dec = f_k - f_try;
         let p_diff = &s_tr - &p_tr;
-        let pred_dec = if p_diff.dot(&p_diff).sqrt() <= 1e-10 * (1.0 + p_tr.dot(&p_tr).sqrt())
-        {
-            pred_dec_tr
-        } else {
+        let p_diff_norm = p_diff.dot(&p_diff).sqrt();
+        let p_norm = p_tr.dot(&p_tr).sqrt();
+        let proj_changed = p_diff_norm > 1e-6 * (1.0 + p_norm);
+        if proj_changed {
+            // If projection materially changes the step, require descent at x_k.
+            let g_proj_k = self.projected_gradient(x_k, g_k);
+            let descent_ok = g_proj_k.dot(&s_tr) <= -eps_g(&g_proj_k, &s_tr, self.tau_g);
+            if !descent_ok {
+                self.trust_radius = (delta * 0.5).max(1e-12);
+                return None;
+            }
+        }
+        let pred_dec = if proj_changed {
             self.trust_region_predicted_decrease(b_inv, g_k, &s_tr)?
+        } else {
+            pred_dec_tr
         };
         if !pred_dec.is_finite() || pred_dec <= 0.0 {
             self.trust_radius = (delta * 0.5).max(1e-12);
@@ -740,6 +751,7 @@ impl BfgsCore {
             // predicted decrease: m(p) = g^T p + 0.5 p^T H p, with H p via solve
             // Since p_b = -H g, we have B p_b = -g for the quadratic model.
             let hpb = -g;
+            // Quadratic model: m(p) = g^T p + 0.5 p^T B p, with B p_b = -g.
             let pred = g.dot(&p_b) + 0.5 * p_b.dot(&hpb);
             let pred_dec = -pred;
             if !pred_dec.is_finite() || pred_dec <= 0.0 {
@@ -751,6 +763,7 @@ impl BfgsCore {
         if p_u_norm >= delta {
             let p = -g * (delta / gnorm2.sqrt());
             let hp = cg_solve_adaptive(b_inv, &p, 50, 1e-10, ridge)?;
+            // Predicted decrease from the quadratic model.
             let pred = g.dot(&p) + 0.5 * p.dot(&hp);
             let pred_dec = -pred;
             if !pred_dec.is_finite() || pred_dec <= 0.0 {
@@ -789,6 +802,7 @@ impl BfgsCore {
             p = p * (delta / p_norm);
         }
         let hp = cg_solve_adaptive(b_inv, &p, 50, 1e-10, ridge)?;
+        // Predicted decrease from the quadratic model.
         let pred = g.dot(&p) + 0.5 * p.dot(&hp);
         let pred_dec = -pred;
         if !pred_dec.is_finite() || pred_dec <= 0.0 {
@@ -1430,7 +1444,7 @@ impl BfgsCore {
                                 let g_try_norm = g_proj_try.dot(&g_proj_try).sqrt();
                                 let f_thresh = f_k.min(f_next) + epsF_iter;
                                 let s_trial = &x_try - &x_k;
-                                let descent_ok = g_proj_try.dot(&s_trial)
+                                let descent_ok = g_proj_k.dot(&s_trial)
                                     <= -eps_g(&g_proj_k, &s_trial, self.tau_g);
                                 let f_ok = f_try <= f_thresh;
                                 let g_ok = g_try_norm <= self.grad_drop_factor * gnext_norm0;
@@ -1604,6 +1618,7 @@ impl BfgsCore {
                         let s_h_s = s_k.dot(&h_s);
                         let denom_raw = s_h_s - sy;
                         let denom = if denom_raw <= 0.0 { 1e-16 } else { denom_raw };
+                        // Powell damping: blend y and B s so that s^T y_tilde is sufficiently positive.
                         let theta_raw = if sy < 0.2 * s_h_s {
                             (0.8 * s_h_s) / denom
                         } else {
@@ -1641,6 +1656,8 @@ impl BfgsCore {
                             let old_binv = b_inv.clone();
                             let hy = old_binv.dot(&y_tilde);
                             let y_h_y = y_tilde.dot(&hy);
+                            // Inverse-BFGS update expanded into symmetric rank-2 terms,
+                            // with coeff = rho + rho^2 * (y^T H y).
                             let coeff = (1.0 + y_h_y * rho) * rho;
                             let mut updated = old_binv.clone();
                             for i in 0..n {
@@ -1967,8 +1984,7 @@ where
 
 /// A line search algorithm that finds a step size satisfying the Strong Wolfe conditions.
 ///
-/// This implementation follows the structure of Algorithm 3.5 in Nocedal & Wright,
-/// with an efficient state-passing mechanism to avoid re-computation.
+/// Bracketing + zoom with safeguards and efficient state-passing to avoid re-computation.
 #[allow(clippy::too_many_arguments)]
 fn line_search<ObjFn>(
     core: &mut BfgsCore,
@@ -1983,7 +1999,7 @@ fn line_search<ObjFn>(
 where
     ObjFn: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
 {
-    let mut alpha_i: f64 = 1.0; // Per Nocedal & Wright, always start with a unit step.
+    let mut alpha_i: f64 = 1.0; // Start with a unit step.
     let mut alpha_prev = 0.0;
 
     let mut f_prev = f_k;
@@ -2390,7 +2406,7 @@ where
     Err(LineSearchError::MaxAttempts(max_attempts))
 }
 
-/// Helper "zoom" function using cubic interpolation, as described by Nocedal & Wright (Alg. 3.6).
+/// Helper "zoom" function using cubic interpolation.
 ///
 /// This function is called when a bracketing interval [alpha_lo, alpha_hi] that contains
 /// a point satisfying the Strong Wolfe conditions is known. It iteratively refines this
@@ -2678,6 +2694,9 @@ where
             {
                 (alpha_lo + alpha_hi) / 2.0
             } else {
+                // Cubic interpolation using endpoint function values and directional derivatives.
+                // d1 and d2 come from the cubic interpolant that matches f and directional
+                // derivatives at the bracket endpoints.
                 let d1 = g_lo_i + g_hi_i - 3.0 * (f_hi_i - f_lo_i) / alpha_diff;
                 let d2_sq = d1 * d1 - g_lo_i * g_hi_i;
 
