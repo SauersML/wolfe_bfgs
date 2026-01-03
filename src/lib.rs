@@ -219,6 +219,43 @@ fn cg_iter_cap(n: usize, base: usize) -> usize {
     }
 }
 
+fn cg_residual_rel(a: &Array2<f64>, x: &Array1<f64>, b: &Array1<f64>, ridge: f64) -> f64 {
+    let n = a.nrows();
+    let mut ax = a.dot(x);
+    if ridge > 0.0 {
+        for i in 0..n {
+            ax[i] += ridge * x[i];
+        }
+    }
+    let r = b - &ax;
+    let r_norm = r.dot(&r).sqrt();
+    let b_norm = b.dot(b).sqrt().max(1.0);
+    r_norm / b_norm
+}
+
+// Adaptive CG: retry with a higher cap/tighter tol if residual is too large.
+fn cg_solve_adaptive(
+    a: &Array2<f64>,
+    b: &Array1<f64>,
+    base_iter: usize,
+    tol: f64,
+    ridge: f64,
+) -> Option<Array1<f64>> {
+    let n = a.nrows();
+    let cap1 = cg_iter_cap(n, base_iter);
+    let x1 = cg_solve(a, b, cap1, tol, ridge)?;
+    let rel1 = cg_residual_rel(a, &x1, b, ridge);
+    if rel1.is_finite() && rel1 <= tol * 10.0 {
+        return Some(x1);
+    }
+    let cap2 = cg_iter_cap(n, base_iter.saturating_mul(2));
+    if cap2 <= cap1 {
+        return Some(x1);
+    }
+    let x2 = cg_solve(a, b, cap2, tol * 0.1, ridge)?;
+    Some(x2)
+}
+
 // Helper: return a scaled identity matrix (lambda * I_n).
 fn scaled_identity(n: usize, lambda: f64) -> Array2<f64> {
     Array2::<f64>::eye(n) * lambda
@@ -467,7 +504,7 @@ impl BfgsCore {
         self.tr_fallback_attempts = self.tr_fallback_attempts + 1;
         let n = b_inv.nrows();
         let delta = self.trust_radius;
-        let (p_tr, _) = self.trust_region_dogleg(b_inv, g_k, delta)?;
+        let (p_tr, pred_dec_tr) = self.trust_region_dogleg(b_inv, g_k, delta)?;
         let raw_try = x_k + &p_tr;
         let x_try = self.project_point(&raw_try);
         let s_tr = &x_try - x_k;
@@ -476,7 +513,13 @@ impl BfgsCore {
         *func_evals += 1;
         *grad_evals += 1;
         let act_dec = f_k - f_try;
-        let pred_dec = self.trust_region_predicted_decrease(b_inv, g_k, &s_tr)?;
+        let p_diff = &s_tr - &p_tr;
+        let pred_dec = if p_diff.dot(&p_diff).sqrt() <= 1e-10 * (1.0 + p_tr.dot(&p_tr).sqrt())
+        {
+            pred_dec_tr
+        } else {
+            self.trust_region_predicted_decrease(b_inv, g_k, &s_tr)?
+        };
         if !pred_dec.is_finite() || pred_dec <= 0.0 {
             self.trust_radius = (delta * 0.5).max(1e-12);
             return None;
@@ -514,7 +557,7 @@ impl BfgsCore {
             let mean_diag = (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
             let ridge = (1e-10 * mean_diag).max(1e-16);
             // Compute B s via CG on H (since H = B^{-1}) for Powell damping.
-            if let Some(h_s) = cg_solve(b_inv, &s_tr, cg_iter_cap(n, 25), 1e-10, ridge) {
+            if let Some(h_s) = cg_solve_adaptive(b_inv, &s_tr, 25, 1e-10, ridge) {
                 let s_h_s = s_tr.dot(&h_s);
                 let y_tr = &g_try - &g_old;
                 let sy_tr = s_tr.dot(&y_tr);
@@ -684,7 +727,7 @@ impl BfgsCore {
         let n = b_inv.nrows();
         let mean_diag = (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
         let ridge = (1e-10 * mean_diag).max(1e-16);
-        let z = cg_solve(b_inv, g, cg_iter_cap(n, 50), 1e-10, ridge)?;
+        let z = cg_solve_adaptive(b_inv, g, 50, 1e-10, ridge)?;
         let gnorm2 = g.dot(g);
         let gHg = g.dot(&z).max(1e-16);
         // Cauchy step
@@ -707,7 +750,7 @@ impl BfgsCore {
         let p_u_norm = p_u.dot(&p_u).sqrt();
         if p_u_norm >= delta {
             let p = -g * (delta / gnorm2.sqrt());
-            let hp = cg_solve(b_inv, &p, cg_iter_cap(n, 50), 1e-10, ridge)?;
+            let hp = cg_solve_adaptive(b_inv, &p, 50, 1e-10, ridge)?;
             let pred = g.dot(&p) + 0.5 * p.dot(&hp);
             let pred_dec = -pred;
             if !pred_dec.is_finite() || pred_dec <= 0.0 {
@@ -745,7 +788,7 @@ impl BfgsCore {
         if p_norm.is_finite() && p_norm > delta && delta.is_finite() && delta > 0.0 {
             p = p * (delta / p_norm);
         }
-        let hp = cg_solve(b_inv, &p, cg_iter_cap(n, 50), 1e-10, ridge)?;
+        let hp = cg_solve_adaptive(b_inv, &p, 50, 1e-10, ridge)?;
         let pred = g.dot(&p) + 0.5 * p.dot(&hp);
         let pred_dec = -pred;
         if !pred_dec.is_finite() || pred_dec <= 0.0 {
@@ -763,7 +806,7 @@ impl BfgsCore {
         let n = b_inv.nrows();
         let mean_diag = (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
         let ridge = (1e-10 * mean_diag).max(1e-16);
-        let hs = cg_solve(b_inv, s, cg_iter_cap(n, 50), 1e-10, ridge)?;
+        let hs = cg_solve_adaptive(b_inv, s, 50, 1e-10, ridge)?;
         let pred = g.dot(s) + 0.5 * s.dot(&hs);
         let pred_dec = -pred;
         if pred_dec.is_finite() && pred_dec > 0.0 {
@@ -1556,7 +1599,7 @@ impl BfgsCore {
                     let mean_diag =
                         (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
                     let ridge = (1e-10 * mean_diag).max(1e-16);
-                    if let Some(h_s) = cg_solve(&b_inv, &s_k, cg_iter_cap(n, 25), 1e-10, ridge)
+                    if let Some(h_s) = cg_solve_adaptive(&b_inv, &s_k, 25, 1e-10, ridge)
                     {
                         let s_h_s = s_k.dot(&h_s);
                         let denom_raw = s_h_s - sy;
