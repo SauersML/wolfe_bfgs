@@ -2111,7 +2111,7 @@ where
 
         if g_i_dot_d >= -eps_g(&g_proj_k, &d_eff, core.tau_g) {
             // The minimum is bracketed between alpha_i and alpha_prev.
-            // The new `hi` is the current point; the new `lo` is the previous.
+            // The current point is the best (low) endpoint.
             let r = zoom(
                 core,
                 obj_fn,
@@ -2123,12 +2123,12 @@ where
                 g_k_dot_d,
                 c1,
                 c2,
-                alpha_prev,
                 alpha_i,
-                f_prev,
+                alpha_prev,
                 f_i,
-                g_prev_dot_d,
+                f_prev,
                 g_i_dot_d,
+                g_prev_dot_d,
                 func_evals,
                 grad_evals,
             );
