@@ -2736,12 +2736,17 @@ where
             // The minimum is bracketed by a point with a negative derivative
             // (alpha_lo) and a point with a positive derivative (alpha_j).
             if g_j_dot_d >= -eps_g(g_proj_k, &d_eff, core.tau_g) {
-                // The new point has a positive derivative, so it becomes the new
-                // upper bound of the bracket. The new interval is [alpha_lo, alpha_j].
-                alpha_hi = alpha_j;
-                f_hi = f_j;
-                g_hi_dot_d = g_j_dot_d;
-                hi_deriv_known = true;
+                // The new point has a positive derivative and a lower function value,
+                // so it becomes the new best (low) point and the old low becomes high.
+                alpha_hi = alpha_lo;
+                f_hi = f_lo;
+                g_hi_dot_d = g_lo_dot_d;
+                hi_deriv_known = lo_deriv_known;
+
+                alpha_lo = alpha_j;
+                f_lo = f_j;
+                g_lo_dot_d = g_j_dot_d;
+                lo_deriv_known = true;
             } else {
                 // The new point has a negative derivative, so it becomes the new
                 // lower bound of the bracket. The new interval is [alpha_j, alpha_hi].
