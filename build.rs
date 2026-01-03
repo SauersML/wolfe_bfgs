@@ -1453,7 +1453,7 @@ fn manually_check_for_unused_variables() {
 }
 
 fn manual_lint_arguments(build_path: &Path) -> Vec<OsString> {
-    vec![
+    let mut args = vec![
         OsString::from("--edition"),
         OsString::from("2024"),
         OsString::from("-D"),
@@ -1466,8 +1466,19 @@ fn manual_lint_arguments(build_path: &Path) -> Vec<OsString> {
         OsString::from("bin"),
         OsString::from("--error-format"),
         OsString::from("human"),
-        build_path.as_os_str().to_os_string(),
-    ]
+    ];
+
+    if let Some(out_dir) = std::env::var_os("OUT_DIR").map(PathBuf::from) {
+        let lint_out_dir = out_dir.join("build_rs_lint");
+        let _ = std::fs::create_dir_all(&lint_out_dir);
+        args.push(OsString::from("--out-dir"));
+        args.push(lint_out_dir.into_os_string());
+        args.push(OsString::from("--emit"));
+        args.push(OsString::from("metadata"));
+    }
+
+    args.push(build_path.as_os_str().to_os_string());
+    args
 }
 
 fn build_dependencies_directory() -> Option<PathBuf> {
