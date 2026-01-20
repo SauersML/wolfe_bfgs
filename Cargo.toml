@@ -5,7 +5,6 @@ authors = ["Paul Kernfeld <paulkernfeld@gmail.com>", "SauersML"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A dense BFGS optimization algorithm in Rust, with a Strong Wolfe line search and initial Hessian scaling."
-build = "build.rs"
 readme = "README.md"
 documentation = "https://github.com/SauersML/"
 repository = "https://github.com/SauersML/wolfe_bfgs"
