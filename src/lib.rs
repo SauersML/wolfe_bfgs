@@ -341,7 +341,15 @@ enum LineSearchError {
     StepSizeTooSmall,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineSearchFailureReason {
+    MaxAttempts,
+    StepSizeTooSmall,
+}
+
 type LsResult = Result<(f64, f64, Array1<f64>, usize, usize, AcceptKind), LineSearchError>;
+const WOLFE_MAX_ATTEMPTS: usize = 20;
+const BACKTRACKING_MAX_ATTEMPTS: usize = 50;
 
 /// An error type for clear diagnostics.
 #[derive(Debug, thiserror::Error)]
@@ -351,13 +359,15 @@ pub enum BfgsError {
     #[error("Internal invariant violated: {message}")]
     InternalInvariant { message: String },
     #[error(
-        "The line search failed to find a suitable step after {max_attempts} attempts. The optimization landscape may be pathological."
+        "The line search failed ({failure_reason:?}) after {max_attempts} attempts. The optimization landscape may be pathological."
     )]
     LineSearchFailed {
         /// The best solution found before the line search failed.
         last_solution: Box<BfgsSolution>,
         /// The number of attempts the line search made before failing.
         max_attempts: usize,
+        /// Why the line search failed.
+        failure_reason: LineSearchFailureReason,
     },
     #[error(
         "Maximum number of iterations reached without converging. The best solution found is returned."
@@ -1022,9 +1032,7 @@ impl BfgsCore {
                         self.wolfe_fail_streak = 0;
                         self.ls_failures_in_row = 0;
                         // Drift c1/c2 back toward canonical quickly on success
-                        if self.wolfe_clean_successes >= 2
-                            || self.bt_clean_successes >= 2
-                        {
+                        if self.wolfe_clean_successes >= 2 || self.bt_clean_successes >= 2 {
                             self.c1_adapt = self.c1;
                             self.c2_adapt = self.c2;
                         } else {
@@ -1091,14 +1099,18 @@ impl BfgsCore {
                                 result
                             } else {
                                 // The fallback also failed. Terminate with the informative error.
-                                let max_attempts =
-                                    if let Err(LineSearchError::MaxAttempts(attempts)) =
-                                        fallback_result
-                                    {
-                                        attempts
-                                    } else {
-                                        0
-                                    };
+                                let (max_attempts, failure_reason) = match fallback_result {
+                                    Err(LineSearchError::MaxAttempts(attempts)) => {
+                                        (attempts, LineSearchFailureReason::MaxAttempts)
+                                    }
+                                    Err(LineSearchError::StepSizeTooSmall) => (
+                                        BACKTRACKING_MAX_ATTEMPTS,
+                                        LineSearchFailureReason::StepSizeTooSmall,
+                                    ),
+                                    Ok(_) => unreachable!(
+                                        "entered fallback failure branch with Ok line-search result"
+                                    ),
+                                };
                                 // Salvage best point seen during line search if any
                                 if let Some(b) = self.global_best.as_ref() {
                                     let epsF = eps_f(f_k, self.tau_f);
@@ -1203,6 +1215,7 @@ impl BfgsCore {
                                     return Err(BfgsError::LineSearchFailed {
                                         last_solution: Box::new(ls),
                                         max_attempts,
+                                        failure_reason,
                                     });
                                 }
                                 if self.ls_failures_in_row >= 2 {
@@ -1217,6 +1230,7 @@ impl BfgsCore {
                                     return Err(BfgsError::LineSearchFailed {
                                         last_solution: Box::new(ls),
                                         max_attempts,
+                                        failure_reason,
                                     });
                                 }
                                 continue;
@@ -1242,14 +1256,18 @@ impl BfgsCore {
                             if let Ok(result) = fallback_result {
                                 result
                             } else {
-                                let max_attempts =
-                                    if let Err(LineSearchError::MaxAttempts(attempts)) =
-                                        fallback_result
-                                    {
-                                        attempts
-                                    } else {
-                                        0
-                                    };
+                                let (max_attempts, failure_reason) = match fallback_result {
+                                    Err(LineSearchError::MaxAttempts(attempts)) => {
+                                        (attempts, LineSearchFailureReason::MaxAttempts)
+                                    }
+                                    Err(LineSearchError::StepSizeTooSmall) => (
+                                        BACKTRACKING_MAX_ATTEMPTS,
+                                        LineSearchFailureReason::StepSizeTooSmall,
+                                    ),
+                                    Ok(_) => unreachable!(
+                                        "entered fallback failure branch with Ok line-search result"
+                                    ),
+                                };
                                 // Full trust-region dogleg fallback
                                 if let Some((x_new, f_new, g_new)) = self.try_trust_region_step(
                                     obj_fn,
@@ -1352,6 +1370,7 @@ impl BfgsCore {
                                     return Err(BfgsError::LineSearchFailed {
                                         last_solution: Box::new(ls),
                                         max_attempts,
+                                        failure_reason,
                                     });
                                 }
                                 if self.ls_failures_in_row >= 2 {
@@ -1366,6 +1385,7 @@ impl BfgsCore {
                                     return Err(BfgsError::LineSearchFailed {
                                         last_solution: Box::new(ls),
                                         max_attempts,
+                                        failure_reason,
                                     });
                                 }
                                 continue;
@@ -1504,10 +1524,8 @@ impl BfgsCore {
                 self.wolfe_fail_streak = 0;
             }
             // Switch back to StrongWolfe after a run of clean backtracking successes
-            if matches!(
-                self.primary_strategy,
-                LineSearchStrategy::Backtracking
-            ) && self.bt_clean_successes >= 3
+            if matches!(self.primary_strategy, LineSearchStrategy::Backtracking)
+                && self.bt_clean_successes >= 3
                 && self.wolfe_fail_streak == 0
             {
                 log::info!(
@@ -1610,11 +1628,9 @@ impl BfgsCore {
             if s_norm > 1e-14 {
                 if !rescued {
                     // Compute B s via CG on H (since H = B^{-1}) for Powell damping.
-                    let mean_diag =
-                        (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
+                    let mean_diag = (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
                     let ridge = (1e-10 * mean_diag).max(1e-16);
-                    if let Some(h_s) = cg_solve_adaptive(&b_inv, &s_k, 25, 1e-10, ridge)
-                    {
+                    if let Some(h_s) = cg_solve_adaptive(&b_inv, &s_k, 25, 1e-10, ridge) {
                         let s_h_s = s_k.dot(&h_s);
                         let denom_raw = s_h_s - sy;
                         let denom = if denom_raw <= 0.0 { 1e-16 } else { denom_raw };
@@ -1682,9 +1698,7 @@ impl BfgsCore {
                     } else {
                         self.chol_fail_iters = self.chol_fail_iters + 1;
                         self.spd_fail_seen = true;
-                        log::warn!(
-                            "[BFGS] B_inv not SPD after ridge; skipping update this iter."
-                        );
+                        log::warn!("[BFGS] B_inv not SPD after ridge; skipping update this iter.");
                         update_status = "skipped";
                     }
                 } else {
@@ -1843,7 +1857,6 @@ impl BfgsCore {
         );
         Err(BfgsError::MaxIterationsReached { last_solution })
     }
-
 }
 
 impl<ObjFn> Bfgs<ObjFn>
@@ -2013,7 +2026,7 @@ where
     }
     let mut g_prev_dot_d = g_k_dot_d;
 
-    let max_attempts = 20;
+    let max_attempts = WOLFE_MAX_ATTEMPTS;
     let mut func_evals = 0;
     let mut grad_evals = 0;
     let epsF = eps_f(f_k, core.tau_f);
@@ -2168,7 +2181,11 @@ where
         }
 
         // Nonmonotone acceptance (GLL) paired with curvature can avoid zoom
-        let fmax = if core.gll.is_empty() { f_k } else { core.gll.fmax() };
+        let fmax = if core.gll.is_empty() {
+            f_k
+        } else {
+            core.gll.fmax()
+        };
         let nonmono_ok = core.accept_nonmonotone(f_k, fmax, gkTs, f_i);
         if nonmono_ok && approx_curv_ok {
             return Ok((
@@ -2259,7 +2276,7 @@ where
 {
     let mut alpha: f64 = 1.0;
     let mut rho = 0.5;
-    let max_attempts = 50;
+    let max_attempts = BACKTRACKING_MAX_ATTEMPTS;
 
     let g_proj_k = core.projected_gradient(x_k, g_k);
     let g_k_dot_d = g_proj_k.dot(d_k);
@@ -2298,9 +2315,17 @@ where
             continue;
         }
 
-        let fmax = if core.gll.is_empty() { f_k } else { core.gll.fmax() };
+        let fmax = if core.gll.is_empty() {
+            f_k
+        } else {
+            core.gll.fmax()
+        };
         let g_proj_new = core.projected_gradient(&x_new, &g_new);
-        let d_eff = if alpha > 0.0 { s.mapv(|v| v / alpha) } else { d_k.clone() };
+        let d_eff = if alpha > 0.0 {
+            s.mapv(|v| v / alpha)
+        } else {
+            d_k.clone()
+        };
         let gk_dot_eff = g_proj_k.dot(&d_eff);
         let gkTs = g_proj_k.dot(&s);
         let armijo_accept = core.accept_nonmonotone(f_k, fmax, gkTs, f_new);
@@ -2502,7 +2527,11 @@ where
                 continue;
             }
             // Acceptance guard (use unified rules + gradient reduction)
-            let fmax = if core.gll.is_empty() { f_k } else { core.gll.fmax() };
+            let fmax = if core.gll.is_empty() {
+                f_k
+            } else {
+                core.gll.fmax()
+            };
             let g_proj_j = core.projected_gradient(&x_j, &g_j);
             let gkTs = g_proj_k.dot(&s_j);
             let d_eff = if alpha_j > 0.0 {
@@ -2536,10 +2565,7 @@ where
                     grad_evals,
                     AcceptKind::Nonmonotone,
                 ));
-            } else if f_flat_ok
-                && curv_ok
-                && g_j_dot_d <= -eps_g(g_proj_k, &d_eff, core.tau_g)
-            {
+            } else if f_flat_ok && curv_ok && g_j_dot_d <= -eps_g(g_proj_k, &d_eff, core.tau_g) {
                 return Ok((
                     alpha_j,
                     f_j,
@@ -2609,7 +2635,11 @@ where
                         AcceptKind::Midpoint,
                     ));
                 }
-                let fmax = if core.gll.is_empty() { f_k } else { core.gll.fmax() };
+                let fmax = if core.gll.is_empty() {
+                    f_k
+                } else {
+                    core.gll.fmax()
+                };
                 let gkTs = g_proj_k.dot(&s_mid);
                 let armijo_ok = core.accept_nonmonotone(f_k, fmax, gkTs, f_mid);
                 let gk_dot_d_eff = if alpha_mid > 0.0 {
@@ -2621,8 +2651,7 @@ where
                     <= c2 * gk_dot_d_eff.abs()
                         + core.curv_slack_scale * eps_g(g_proj_k, &d_eff, core.tau_g);
                 let gdrop = g_proj_mid.iter().map(|v| v * v).sum::<f64>().sqrt()
-                    <= core.grad_drop_factor
-                        * g_proj_k.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    <= core.grad_drop_factor * g_proj_k.iter().map(|v| v * v).sum::<f64>().sqrt();
                 if armijo_ok && curv_ok {
                     return Ok((
                         alpha_mid,
@@ -2675,12 +2704,11 @@ where
             return Err(LineSearchError::MaxAttempts(max_zoom_attempts));
         }
         let alpha_j = {
-            let (alpha_lo_i, alpha_hi_i, f_lo_i, f_hi_i, g_lo_i, g_hi_i) =
-                if alpha_lo <= alpha_hi {
-                    (alpha_lo, alpha_hi, f_lo, f_hi, g_lo_dot_d, g_hi_dot_d)
-                } else {
-                    (alpha_hi, alpha_lo, f_hi, f_lo, g_hi_dot_d, g_lo_dot_d)
-                };
+            let (alpha_lo_i, alpha_hi_i, f_lo_i, f_hi_i, g_lo_i, g_hi_i) = if alpha_lo <= alpha_hi {
+                (alpha_lo, alpha_hi, f_lo, f_hi, g_lo_dot_d, g_hi_dot_d)
+            } else {
+                (alpha_hi, alpha_lo, f_hi, f_lo, g_hi_dot_d, g_lo_dot_d)
+            };
 
             let alpha_diff = alpha_hi_i - alpha_lo_i;
 
@@ -2702,8 +2730,8 @@ where
 
                 if d2_sq >= 0.0 && d2_sq.is_finite() {
                     let d2 = d2_sq.sqrt();
-                    let trial = alpha_hi_i
-                        - alpha_diff * (g_hi_i + d2 - d1) / (g_hi_i - g_lo_i + 2.0 * d2);
+                    let trial =
+                        alpha_hi_i - alpha_diff * (g_hi_i + d2 - d1) / (g_hi_i - g_lo_i + 2.0 * d2);
 
                     // If interpolation gives a non-finite value or a point outside
                     // the bracket, fall back to bisection.
@@ -2757,7 +2785,11 @@ where
 
         // Check if the new point `alpha_j` satisfies the sufficient decrease condition.
         // An infinite `f_j` means the step was too large and failed the condition.
-        let fmax = if core.gll.is_empty() { f_k } else { core.gll.fmax() };
+        let fmax = if core.gll.is_empty() {
+            f_k
+        } else {
+            core.gll.fmax()
+        };
         let g_proj_j = core.projected_gradient(&x_j, &g_j);
         let gkTs = g_proj_k.dot(&s_j);
         let d_eff = if alpha_j > 0.0 {
@@ -2895,7 +2927,11 @@ where
             d_k.clone()
         };
         let gkTs = g_proj_k.dot(&s);
-        let fmax = if core.gll.is_empty() { f_k } else { core.gll.fmax() };
+        let fmax = if core.gll.is_empty() {
+            f_k
+        } else {
+            core.gll.fmax()
+        };
         let ok_f = core.accept_nonmonotone(f_k, fmax, gkTs, f);
         let gi_norm = g_proj.dot(&g_proj).sqrt();
         let dir_ok = g_proj.dot(&d_eff) <= -eps_g(&g_proj_k, &d_eff, tau_g);
@@ -2924,8 +2960,10 @@ mod tests {
     //    `argmin`, a trusted, state-of-the-art optimization library, ensuring
     //    that our results (final point and iteration count) are equivalent.
 
-    use super::{Bfgs, BfgsError, BfgsSolution};
-    use ndarray::{array, Array1, Array2};
+    use super::{
+        BACKTRACKING_MAX_ATTEMPTS, Bfgs, BfgsError, BfgsSolution, LineSearchFailureReason,
+    };
+    use ndarray::{Array1, Array2, array};
     use spectral::prelude::*;
 
     // --- Test Harness: Python scipy.optimize Comparison Setup ---
@@ -3118,22 +3156,14 @@ mod tests {
         let (f_k, g_k) = obj(&x0);
         core.global_best = Some(super::ProbeBest::new(&x0, f_k, &g_k));
         let d_k = array![1.0];
-        let r = super::line_search(
-            &mut core,
-            &mut obj,
-            &x0,
-            &d_k,
-            f_k,
-            &g_k,
-            c1,
-            c2,
-        );
+        let r = super::line_search(&mut core, &mut obj, &x0, &d_k, f_k, &g_k, c1, c2);
         assert!(r.is_err());
-        assert!(core
-            .global_best
-            .as_ref()
-            .map(|b| b.f.is_finite())
-            .unwrap_or(false));
+        assert!(
+            core.global_best
+                .as_ref()
+                .map(|b| b.f.is_finite())
+                .unwrap_or(false)
+        );
     }
 
     /// A function whose gradient is constant, causing `y_k` to be zero.
@@ -3281,6 +3311,42 @@ mod tests {
             result,
             Err(BfgsError::GradientIsNaN) | Err(BfgsError::LineSearchFailed { .. })
         ));
+    }
+
+    #[test]
+    fn test_linesearch_failed_reports_nonzero_attempts() {
+        let x0 = array![0.0, 0.0, 0.0];
+        let mut solver = Bfgs::new(x0, |x: &Array1<f64>| {
+            let r2 = x.dot(x);
+            if r2 <= 1e-24 {
+                (833.403058988699, array![1.1751972450892738, 0.0, 0.0])
+            } else {
+                (f64::INFINITY, array![f64::NAN, f64::NAN, f64::NAN])
+            }
+        });
+        let result = solver.run();
+        match result {
+            Err(err @ BfgsError::LineSearchFailed {
+                max_attempts,
+                failure_reason,
+                ..
+            }) => {
+                assert!(max_attempts > 0, "max_attempts should never be 0");
+                assert_eq!(max_attempts, BACKTRACKING_MAX_ATTEMPTS);
+                assert!(matches!(
+                    failure_reason,
+                    LineSearchFailureReason::MaxAttempts
+                        | LineSearchFailureReason::StepSizeTooSmall
+                ));
+                let rendered = format!("{err}");
+                assert!(
+                    rendered.contains("MaxAttempts")
+                        || rendered.contains("StepSizeTooSmall"),
+                    "error should include failure reason, got: {rendered}"
+                );
+            }
+            other => panic!("expected LineSearchFailed, got: {other:?}"),
+        }
     }
 
     // --- 3. Comparison Tests against a Trusted Library ---
