@@ -261,6 +261,19 @@ fn scaled_identity(n: usize, lambda: f64) -> Array2<f64> {
     Array2::<f64>::eye(n) * lambda
 }
 
+fn symmetrize(a: &Array2<f64>) -> Array2<f64> {
+    let n = a.nrows();
+    let mut out = a.clone();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let v = 0.5 * (a[[i, j]] + a[[j, i]]);
+            out[[i, j]] = v;
+            out[[j, i]] = v;
+        }
+    }
+    out
+}
+
 // Box constraints with projection and active-set tolerance.
 #[derive(Clone)]
 struct BoxSpec {
@@ -401,6 +414,307 @@ pub struct BfgsSolution {
     pub func_evals: usize,
     /// The total number of times the gradient was evaluated.
     pub grad_evals: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NewtonTrustRegionError {
+    #[error("Invalid bounds: {message}")]
+    InvalidBounds { message: String },
+    #[error(
+        "Objective returned a Hessian with shape {got_rows}x{got_cols}; expected {expected}x{expected}"
+    )]
+    HessianShapeMismatch {
+        expected: usize,
+        got_rows: usize,
+        got_cols: usize,
+    },
+    #[error("Objective returned non-finite values.")]
+    NonFiniteObjective,
+    #[error("Failed to form a positive-definite trust-region model Hessian.")]
+    ModelHessianNotSpd,
+    #[error(
+        "Maximum number of iterations reached without converging. The best solution found is returned."
+    )]
+    MaxIterationsReached { last_solution: Box<BfgsSolution> },
+}
+
+struct NewtonTrustRegionCore {
+    x0: Array1<f64>,
+    tolerance: f64,
+    max_iterations: usize,
+    bounds: Option<BoxSpec>,
+    config_error: Option<String>,
+    trust_radius: f64,
+    trust_radius_max: f64,
+    eta_accept: f64,
+}
+
+pub struct NewtonTrustRegion<ObjFn> {
+    core: NewtonTrustRegionCore,
+    obj_fn: ObjFn,
+}
+
+impl NewtonTrustRegionCore {
+    fn new(x0: Array1<f64>) -> Self {
+        Self {
+            x0,
+            tolerance: 1e-5,
+            max_iterations: 100,
+            bounds: None,
+            config_error: None,
+            trust_radius: 1.0,
+            trust_radius_max: 1e6,
+            eta_accept: 0.1,
+        }
+    }
+
+    #[inline]
+    fn project_point(&self, x: &Array1<f64>) -> Array1<f64> {
+        if let Some(bounds) = &self.bounds {
+            bounds.project(x)
+        } else {
+            x.clone()
+        }
+    }
+
+    #[inline]
+    fn projected_gradient(&self, x: &Array1<f64>, g: &Array1<f64>) -> Array1<f64> {
+        if let Some(bounds) = &self.bounds {
+            bounds.projected_gradient(x, g)
+        } else {
+            g.clone()
+        }
+    }
+
+    fn predicted_decrease(h_model: &Array2<f64>, g_proj: &Array1<f64>, step: &Array1<f64>) -> f64 {
+        let hs = h_model.dot(step);
+        -(g_proj.dot(step) + 0.5 * step.dot(&hs))
+    }
+
+    fn dogleg_step(
+        &self,
+        h_model: &Array2<f64>,
+        g_proj: &Array1<f64>,
+        trust_radius: f64,
+        ridge: f64,
+    ) -> Option<(Array1<f64>, f64)> {
+        let neg_g = g_proj.mapv(|v| -v);
+        let p_newton_opt = cg_solve_adaptive(h_model, &neg_g, 50, 1e-10, ridge);
+        if let Some(p_newton) = p_newton_opt.as_ref() {
+            let p_newton_norm = p_newton.dot(p_newton).sqrt();
+            if p_newton_norm <= trust_radius {
+                let pred = Self::predicted_decrease(h_model, g_proj, p_newton);
+                if pred.is_finite() && pred > 0.0 {
+                    return Some((p_newton.clone(), pred));
+                }
+            }
+        }
+
+        let g_norm2 = g_proj.dot(g_proj);
+        if !g_norm2.is_finite() || g_norm2 <= 0.0 {
+            return None;
+        }
+        let mut hg = h_model.dot(g_proj);
+        if ridge > 0.0 {
+            for i in 0..hg.len() {
+                hg[i] += ridge * g_proj[i];
+            }
+        }
+        let g_h_g = g_proj.dot(&hg);
+        let p_cauchy = if g_h_g.is_finite() && g_h_g > 1e-16 {
+            g_proj.mapv(|v| -(g_norm2 / g_h_g) * v)
+        } else {
+            g_proj.mapv(|v| -(trust_radius / g_norm2.sqrt()) * v)
+        };
+        let p_cauchy_norm = p_cauchy.dot(&p_cauchy).sqrt();
+        if !p_cauchy_norm.is_finite() {
+            return None;
+        }
+        if p_cauchy_norm >= trust_radius {
+            let p = g_proj.mapv(|v| -(trust_radius / g_norm2.sqrt()) * v);
+            let pred = Self::predicted_decrease(h_model, g_proj, &p);
+            if pred.is_finite() && pred > 0.0 {
+                return Some((p, pred));
+            }
+            return Some((p, trust_radius * g_norm2.sqrt()));
+        }
+
+        let p_newton = match p_newton_opt {
+            Some(p) => p,
+            None => {
+                let pred = Self::predicted_decrease(h_model, g_proj, &p_cauchy);
+                if pred.is_finite() && pred > 0.0 {
+                    return Some((p_cauchy, pred));
+                }
+                return Some((p_cauchy, trust_radius * g_norm2.sqrt()));
+            }
+        };
+        let s = &p_newton - &p_cauchy;
+        let a = s.dot(&s);
+        let b = 2.0 * p_cauchy.dot(&s);
+        let c = p_cauchy.dot(&p_cauchy) - trust_radius * trust_radius;
+        let disc = b * b - 4.0 * a * c;
+        if !disc.is_finite() || disc < 0.0 || a <= 0.0 {
+            return None;
+        }
+        let sqrt_disc = disc.sqrt();
+        let t1 = (-b - sqrt_disc) / (2.0 * a);
+        let t2 = (-b + sqrt_disc) / (2.0 * a);
+        let mut t = 0.5;
+        if t1.is_finite() && t1 >= 0.0 && t1 <= 1.0 {
+            t = t1;
+        }
+        if t2.is_finite() && t2 >= 0.0 && t2 <= 1.0 {
+            t = t.min(t2);
+        }
+        let p = &p_cauchy + &(s * t);
+        let pred = Self::predicted_decrease(h_model, g_proj, &p);
+        if pred.is_finite() && pred > 0.0 {
+            Some((p, pred))
+        } else {
+            None
+        }
+    }
+
+    fn run<ObjFn>(&mut self, obj_fn: &mut ObjFn) -> Result<BfgsSolution, NewtonTrustRegionError>
+    where
+        ObjFn: FnMut(&Array1<f64>) -> (f64, Array1<f64>, Array2<f64>),
+    {
+        if let Some(message) = self.config_error.clone() {
+            return Err(NewtonTrustRegionError::InvalidBounds { message });
+        }
+        let n = self.x0.len();
+        let mut x_k = self.project_point(&self.x0);
+        let (mut f_k, mut g_k, mut h_k) = obj_fn(&x_k);
+        if h_k.nrows() != n || h_k.ncols() != n {
+            return Err(NewtonTrustRegionError::HessianShapeMismatch {
+                expected: n,
+                got_rows: h_k.nrows(),
+                got_cols: h_k.ncols(),
+            });
+        }
+        if !f_k.is_finite()
+            || g_k.iter().any(|v| !v.is_finite())
+            || h_k.iter().any(|v| !v.is_finite())
+        {
+            return Err(NewtonTrustRegionError::NonFiniteObjective);
+        }
+
+        let mut func_evals = 1usize;
+        let mut grad_evals = 1usize;
+        let mut trust_radius = self.trust_radius.max(1e-8);
+        let mut g_proj_k = self.projected_gradient(&x_k, &g_k);
+
+        for k in 0..self.max_iterations {
+            let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
+            if g_norm.is_finite() && g_norm <= self.tolerance {
+                return Ok(BfgsSolution {
+                    final_point: x_k,
+                    final_value: f_k,
+                    final_gradient_norm: g_norm,
+                    iterations: k,
+                    func_evals,
+                    grad_evals,
+                });
+            }
+
+            let h_sym = symmetrize(&h_k);
+            let mut h_model = h_sym.clone();
+            let mut used_shift = 0.0_f64;
+            let mut trial: Option<(Array1<f64>, f64)> = None;
+            for _ in 0..10 {
+                let ridge = used_shift.max(1e-16);
+                if let Some(step) = self.dogleg_step(&h_model, &g_proj_k, trust_radius, ridge) {
+                    trial = Some(step);
+                    break;
+                }
+                used_shift = if used_shift == 0.0 {
+                    1e-8
+                } else {
+                    (used_shift * 10.0_f64).min(1e8_f64)
+                };
+                h_model = h_sym.clone();
+                for i in 0..n {
+                    h_model[[i, i]] += used_shift;
+                }
+            }
+            let (trial_step, pred_dec_raw) = match trial {
+                Some(v) => v,
+                None => {
+                    return Err(NewtonTrustRegionError::ModelHessianNotSpd);
+                }
+            };
+
+            let x_trial_raw = &x_k + &trial_step;
+            let x_trial = self.project_point(&x_trial_raw);
+            let s_trial = &x_trial - &x_k;
+            let s_norm = s_trial.dot(&s_trial).sqrt();
+            if !s_norm.is_finite() || s_norm <= 1e-16 {
+                trust_radius = (trust_radius * 0.5).max(1e-12);
+                continue;
+            }
+            let pred_dec = if (&s_trial - &trial_step)
+                .dot(&(&s_trial - &trial_step))
+                .sqrt()
+                > 1e-8 * (1.0 + trial_step.dot(&trial_step).sqrt())
+            {
+                Self::predicted_decrease(&h_model, &g_proj_k, &s_trial)
+            } else {
+                pred_dec_raw
+            };
+            if !pred_dec.is_finite() || pred_dec <= 0.0 {
+                trust_radius = (trust_radius * 0.5).max(1e-12);
+                continue;
+            }
+
+            let (f_trial, g_trial, h_trial) = obj_fn(&x_trial);
+            func_evals += 1;
+            grad_evals += 1;
+            if h_trial.nrows() != n || h_trial.ncols() != n {
+                return Err(NewtonTrustRegionError::HessianShapeMismatch {
+                    expected: n,
+                    got_rows: h_trial.nrows(),
+                    got_cols: h_trial.ncols(),
+                });
+            }
+            if !f_trial.is_finite()
+                || g_trial.iter().any(|v| !v.is_finite())
+                || h_trial.iter().any(|v| !v.is_finite())
+            {
+                trust_radius = (trust_radius * 0.5).max(1e-12);
+                continue;
+            }
+            let act_dec = f_k - f_trial;
+            let rho = act_dec / pred_dec;
+            if rho > 0.75 && s_norm > 0.99 * trust_radius {
+                trust_radius = (trust_radius * 2.0).min(self.trust_radius_max.max(1.0));
+            } else if rho < 0.25 {
+                trust_radius = (trust_radius * 0.5).max(1e-12);
+            } else if used_shift > 0.0 {
+                trust_radius = (trust_radius * 1.1).min(self.trust_radius_max.max(1.0));
+            }
+
+            if rho > self.eta_accept {
+                x_k = x_trial;
+                f_k = f_trial;
+                g_k = g_trial;
+                h_k = h_trial;
+                g_proj_k = self.projected_gradient(&x_k, &g_k);
+            }
+        }
+
+        let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
+        Err(NewtonTrustRegionError::MaxIterationsReached {
+            last_solution: Box::new(BfgsSolution {
+                final_point: x_k,
+                final_value: f_k,
+                final_gradient_norm: g_norm,
+                iterations: self.max_iterations,
+                func_evals,
+                grad_evals,
+            }),
+        })
+    }
 }
 
 /// Core configuration and adaptive state for the BFGS solver.
@@ -1995,6 +2309,82 @@ where
     }
 }
 
+impl<ObjFn> NewtonTrustRegion<ObjFn>
+where
+    ObjFn: FnMut(&Array1<f64>) -> (f64, Array1<f64>, Array2<f64>),
+{
+    /// Creates a new Newton trust-region solver.
+    ///
+    /// # Arguments
+    /// * `x0` - The initial guess for the minimum.
+    /// * `obj_fn` - The objective function returning `(value, gradient, hessian)`.
+    pub fn new(x0: Array1<f64>, obj_fn: ObjFn) -> Self {
+        Self {
+            core: NewtonTrustRegionCore::new(x0),
+            obj_fn,
+        }
+    }
+
+    /// Sets the convergence tolerance on projected gradient norm (default: 1e-5).
+    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
+        self.core.tolerance = tolerance.max(1e-12);
+        self
+    }
+
+    /// Sets the maximum number of iterations (default: 100).
+    pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
+        self.core.max_iterations = max_iterations.max(1);
+        self
+    }
+
+    /// Provides simple box bounds for each coordinate (lower <= x <= upper).
+    pub fn with_bounds(mut self, lower: Array1<f64>, upper: Array1<f64>, tol: f64) -> Self {
+        if lower.len() != upper.len() {
+            self.core.config_error = Some("lower/upper lengths differ".to_string());
+            return self;
+        }
+        for i in 0..lower.len() {
+            if lower[i] > upper[i] {
+                self.core.config_error =
+                    Some(format!("lower bound exceeds upper bound at index {}", i));
+                return self;
+            }
+        }
+        self.core.config_error = None;
+        self.core.bounds = Some(BoxSpec::new(lower, upper, tol.max(0.0)));
+        self
+    }
+
+    /// Sets the initial trust-region radius.
+    pub fn with_initial_trust_radius(mut self, trust_radius: f64) -> Self {
+        if trust_radius.is_finite() && trust_radius > 0.0 {
+            self.core.trust_radius = trust_radius;
+        }
+        self
+    }
+
+    /// Sets the maximum trust-region radius.
+    pub fn with_max_trust_radius(mut self, trust_radius_max: f64) -> Self {
+        if trust_radius_max.is_finite() && trust_radius_max > 0.0 {
+            self.core.trust_radius_max = trust_radius_max;
+        }
+        self
+    }
+
+    /// Sets the acceptance ratio threshold for trial steps (default: 0.1).
+    pub fn with_acceptance_threshold(mut self, eta_accept: f64) -> Self {
+        if eta_accept.is_finite() {
+            self.core.eta_accept = eta_accept.clamp(0.0, 0.9);
+        }
+        self
+    }
+
+    /// Executes the Newton trust-region optimization.
+    pub fn run(&mut self) -> Result<BfgsSolution, NewtonTrustRegionError> {
+        self.core.run(&mut self.obj_fn)
+    }
+}
+
 /// A line search algorithm that finds a step size satisfying the Strong Wolfe conditions.
 ///
 /// Bracketing + zoom with safeguards and efficient state-passing to avoid re-computation.
@@ -2962,6 +3352,7 @@ mod tests {
 
     use super::{
         BACKTRACKING_MAX_ATTEMPTS, Bfgs, BfgsError, BfgsSolution, LineSearchFailureReason,
+        NewtonTrustRegion,
     };
     use ndarray::{Array1, Array2, array};
     use spectral::prelude::*;
@@ -3095,6 +3486,21 @@ mod tests {
         (f, g)
     }
 
+    fn rosenbrock_with_hessian(x: &Array1<f64>) -> (f64, Array1<f64>, Array2<f64>) {
+        let a = 1.0;
+        let b = 100.0;
+        let f = (a - x[0]).powi(2) + b * (x[1] - x[0].powi(2)).powi(2);
+        let g = array![
+            -2.0 * (a - x[0]) - 4.0 * b * (x[1] - x[0].powi(2)) * x[0],
+            2.0 * b * (x[1] - x[0].powi(2))
+        ];
+        let h = array![
+            [1200.0 * x[0] * x[0] - 400.0 * x[1] + 2.0, -400.0 * x[0]],
+            [-400.0 * x[0], 200.0]
+        ];
+        (f, g, h)
+    }
+
     /// A function with a maximum at 0, guaranteed to fail the Wolfe curvature condition.
     fn non_convex_max(x: &Array1<f64>) -> (f64, Array1<f64>) {
         (-x.dot(x), -2.0 * x)
@@ -3164,6 +3570,18 @@ mod tests {
                 .map(|b| b.f.is_finite())
                 .unwrap_or(false)
         );
+    }
+
+    #[test]
+    fn newton_trust_region_converges_on_rosenbrock() {
+        let x0 = array![-1.2, 1.0];
+        let mut solver = NewtonTrustRegion::new(x0, rosenbrock_with_hessian)
+            .with_tolerance(1e-8)
+            .with_max_iterations(100);
+        let solution = solver.run().expect("Newton trust-region should converge");
+        assert!((solution.final_point[0] - 1.0).abs() < 1e-6);
+        assert!((solution.final_point[1] - 1.0).abs() < 1e-6);
+        assert!(solution.final_gradient_norm < 1e-6);
     }
 
     /// A function whose gradient is constant, causing `y_k` to be zero.
@@ -3326,11 +3744,13 @@ mod tests {
         });
         let result = solver.run();
         match result {
-            Err(err @ BfgsError::LineSearchFailed {
-                max_attempts,
-                failure_reason,
-                ..
-            }) => {
+            Err(
+                err @ BfgsError::LineSearchFailed {
+                    max_attempts,
+                    failure_reason,
+                    ..
+                },
+            ) => {
                 assert!(max_attempts > 0, "max_attempts should never be 0");
                 assert_eq!(max_attempts, BACKTRACKING_MAX_ATTEMPTS);
                 assert!(matches!(
@@ -3340,8 +3760,7 @@ mod tests {
                 ));
                 let rendered = format!("{err}");
                 assert!(
-                    rendered.contains("MaxAttempts")
-                        || rendered.contains("StepSizeTooSmall"),
+                    rendered.contains("MaxAttempts") || rendered.contains("StepSizeTooSmall"),
                     "error should include failure reason, got: {rendered}"
                 );
             }
