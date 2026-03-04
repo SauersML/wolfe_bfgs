@@ -1,10 +1,15 @@
-# Adaptive BFGS in Rust
+# Adaptive BFGS, Newton TR, and ARC in Rust
 
 [![Crates.io](https://img.shields.io/crates/v/wolfe-bfgs.svg)](https://crates.io/crates/wolfe-bfgs)
 [![Docs.rs](https://docs.rs/wolfe_bfgs/badge.svg)](https://docs.rs/wolfe_bfgs)
 [![Build Status](https://github.com/SauersML/wolfe_bfgs/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/wolfe_bfgs/actions)
 
-A pure Rust implementation of a dense BFGS optimizer with an adaptive, fault-tolerant architecture. It is designed for messy, real-world nonlinear problems (including optional box constraints), and is built on principles from Nocedal & Wright's *Numerical Optimization* with robustness extensions.
+A pure Rust implementation of dense nonlinear optimization solvers with an adaptive, fault-tolerant architecture:
+- `Bfgs` (hybrid line-search quasi-Newton),
+- `NewtonTrustRegion` (Hessian-based trust-region),
+- `Arc` (Adaptive Regularization with Cubics).
+
+It is designed for messy, real-world nonlinear problems (including optional box constraints), and is built on principles from Nocedal & Wright's *Numerical Optimization* with robustness extensions.
 
 This work is a rewrite of the original `bfgs` crate by Paul Kernfeld.
 
@@ -19,6 +24,8 @@ This work is a rewrite of the original `bfgs` crate by Paul Kernfeld.
 *   **Ergonomic API**: Uses the builder pattern for clear and flexible configuration of the solver.
 *   **Robust Error Handling**: Provides descriptive errors and returns the best known solution even when the solver exits early.
 *   **Dense BFGS Implementation**: Stores the full $n \times n$ inverse Hessian approximation, suitable for small- to medium-scale optimization problems.
+*   **Newton Trust-Region Solver**: Hessian-driven trust-region method with projected steps and configurable fallback.
+*   **ARC Solver**: Adaptive cubic regularization with acceptance-ratio logic and dynamic regularization updates.
 
 ## Usage
 
@@ -26,7 +33,7 @@ First, add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-wolfe_bfgs = "0.2.1"
+wolfe_bfgs = "0.2.4"
 ```
 
 ### Example: Minimizing the Rosenbrock Function
@@ -112,6 +119,56 @@ match result {
     Err(e) => eprintln!("Failed: {e}"),
 }
 ```
+
+### Example: ARC (Adaptive Regularization with Cubics)
+
+```rust
+use wolfe_bfgs::{Arc, ObjectiveRequest, ObjectiveSample};
+use ndarray::{array, Array1, Array2};
+
+fn rosenbrock_with_hessian(x: &Array1<f64>) -> (f64, Array1<f64>, Array2<f64>) {
+    let a = 1.0;
+    let b = 100.0;
+    let x1 = x[0];
+    let x2 = x[1];
+    let f = (a - x1).powi(2) + b * (x2 - x1.powi(2)).powi(2);
+    let g = array![
+        -2.0 * (a - x1) - 4.0 * b * (x2 - x1.powi(2)) * x1,
+        2.0 * b * (x2 - x1.powi(2)),
+    ];
+    let h = array![
+        [2.0 - 4.0 * b * x2 + 12.0 * b * x1.powi(2), -4.0 * b * x1],
+        [-4.0 * b * x1, 2.0 * b],
+    ];
+    (f, g, h)
+}
+
+let x0 = array![-1.2, 1.0];
+let mut solver = Arc::new(x0, |x, req| {
+    let (f, g, h) = rosenbrock_with_hessian(x);
+    match req {
+        ObjectiveRequest::CostOnly => Ok(ObjectiveSample::cost_only(f)),
+        ObjectiveRequest::CostAndGradient => Ok(ObjectiveSample::cost_and_gradient(f, g)),
+        ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+            Ok(ObjectiveSample::cost_gradient_hessian(f, g, h))
+        }
+    }
+})
+.with_tolerance(1e-7)
+.with_max_iterations(250);
+
+let solution = solver.run().expect("ARC failed");
+assert!(solution.final_gradient_norm < 1e-5);
+```
+
+ARC in this crate uses the standard acceptance-ratio update structure:
+- accept when `rho >= eta1`, mark very successful when `rho >= eta2`,
+- decrease/increase `sigma` via multiplicative `gamma` factors,
+- require inexact first-order subproblem progress (`||∇m(s)|| <= theta ||s||^2`).
+
+Under the classical assumptions used in ARC analysis (for example lower-bounded
+objective and Lipschitz-continuous Hessian), this algorithmic template is associated
+with `O(eps^-1.5)` first-order iteration complexity.
 
 ## Algorithm Details
 
