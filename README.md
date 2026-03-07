@@ -1,19 +1,24 @@
 # Optimization Workspace
 
-This repository now contains two Rust crates:
+This repository contains two Rust crates:
 
-- `opt`: the full nonlinear optimization crate with BFGS, Newton trust-region, and ARC.
-- `wolfe_bfgs`: the focused BFGS crate.
+- `opt`: the full nonlinear optimization crate with BFGS, Newton trust-region, and ARC
+- `wolfe_bfgs`: the focused BFGS-only crate
 
-Publish each package from the workspace root with:
+Repository layout:
+
+- `opt/`
+- `wolfe_bfgs/`
+
+Common workspace commands:
 
 ```bash
+cargo test --workspace
 cargo publish -p opt
 cargo publish -p wolfe_bfgs
 ```
 
-Or validate the full workspace with:
+For package-level documentation, see:
 
-```bash
-cargo test --workspace
-```
+- `opt/README.md`
+- `wolfe_bfgs/README.md`
