@@ -839,16 +839,6 @@ impl<'a> SymmetricHessianMut<'a> {
         self.data.fill(value);
     }
 
-    fn reborrow(&mut self) -> SymmetricHessianMut<'_> {
-        SymmetricHessianMut {
-            data: &mut *self.data,
-        }
-    }
-
-    fn as_array(&self) -> &Array2<f64> {
-        self.data
-    }
-
     pub fn set(&mut self, i: usize, j: usize, value: f64) {
         self.data[[i, j]] = value;
         self.data[[j, i]] = value;
@@ -935,7 +925,6 @@ pub struct BfgsSolution {
 pub enum ObjectiveEvalError {
     Recoverable { message: String },
     Fatal { message: String },
-    ContractViolation { message: String },
 }
 
 impl ObjectiveEvalError {
@@ -947,12 +936,6 @@ impl ObjectiveEvalError {
 
     pub fn fatal(message: impl Into<String>) -> Self {
         Self::Fatal {
-            message: message.into(),
-        }
-    }
-
-    fn contract_violation(message: impl Into<String>) -> Self {
-        Self::ContractViolation {
             message: message.into(),
         }
     }
@@ -971,245 +954,6 @@ pub trait SecondOrderObjective {
         grad_out: &mut Array1<f64>,
         hess_out: SymmetricHessianMut<'_>,
     ) -> Result<f64, ObjectiveEvalError>;
-}
-
-const CONTRACT_CHECK_EVALS: usize = 2;
-const CONTRACT_GRAD_REL_TOL: f64 = 5e-3;
-const CONTRACT_HESS_REL_TOL: f64 = 5e-2;
-
-#[derive(Clone, Copy)]
-struct ObjectiveCheckState {
-    checks_completed: usize,
-}
-
-impl ObjectiveCheckState {
-    fn new() -> Self {
-        Self { checks_completed: 0 }
-    }
-
-    fn next_axis(&self, n: usize) -> Option<usize> {
-        if self.checks_completed < CONTRACT_CHECK_EVALS && n > 0 {
-            Some(self.checks_completed % n)
-        } else {
-            None
-        }
-    }
-
-    fn advance(&mut self) {
-        self.checks_completed += 1;
-    }
-}
-
-fn finite_difference_step(x_i: f64) -> f64 {
-    1e-6 * (1.0 + x_i.abs())
-}
-
-fn max_abs(v: &Array1<f64>) -> f64 {
-    v.iter().fold(0.0, |acc, &value| acc.max(value.abs()))
-}
-
-struct CheckedFirstOrder<ObjFn> {
-    inner: ObjFn,
-    checks: ObjectiveCheckState,
-}
-
-impl<ObjFn> CheckedFirstOrder<ObjFn> {
-    fn new(inner: ObjFn) -> Self {
-        Self {
-            inner,
-            checks: ObjectiveCheckState::new(),
-        }
-    }
-}
-
-impl<ObjFn> FirstOrderObjective for CheckedFirstOrder<ObjFn>
-where
-    ObjFn: FirstOrderObjective,
-{
-    fn eval(&mut self, x: &Array1<f64>, grad_out: &mut Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-        grad_out.fill(f64::NAN);
-        let cost = self.inner.eval(x, grad_out)?;
-        if !cost.is_finite() {
-            return Err(ObjectiveEvalError::contract_violation(
-                "objective returned a non-finite cost",
-            ));
-        }
-        if grad_out.len() != x.len() {
-            return Err(ObjectiveEvalError::contract_violation(
-                "objective wrote a gradient with the wrong dimension",
-            ));
-        }
-        if grad_out.iter().any(|value| !value.is_finite()) {
-            return Err(ObjectiveEvalError::contract_violation(
-                "objective returned a gradient with non-finite or unwritten entries",
-            ));
-        }
-        if let Some(axis) = self.checks.next_axis(x.len()) {
-            let eps = finite_difference_step(x[axis]);
-            let mut x_plus = x.clone();
-            let mut x_minus = x.clone();
-            x_plus[axis] += eps;
-            x_minus[axis] -= eps;
-            let mut grad_plus = Array1::from_elem(x.len(), f64::NAN);
-            let mut grad_minus = Array1::from_elem(x.len(), f64::NAN);
-            let f_plus = match self.inner.eval(&x_plus, &mut grad_plus) {
-                Ok(value) => value,
-                Err(err) => {
-                    return Err(ObjectiveEvalError::contract_violation(format!(
-                        "objective failed gradient contract checking at x + eps*e_{axis}: {err:?}"
-                    )));
-                }
-            };
-            let f_minus = match self.inner.eval(&x_minus, &mut grad_minus) {
-                Ok(value) => value,
-                Err(err) => {
-                    return Err(ObjectiveEvalError::contract_violation(format!(
-                        "objective failed gradient contract checking at x - eps*e_{axis}: {err:?}"
-                    )));
-                }
-            };
-            if !f_plus.is_finite() || !f_minus.is_finite() {
-                return Err(ObjectiveEvalError::contract_violation(
-                    "objective failed finite-difference gradient checking with non-finite costs",
-                ));
-            }
-            let fd = (f_plus - f_minus) / (2.0 * eps);
-            let reported = grad_out[axis];
-            let rel_err = (fd - reported).abs() / fd.abs().max(reported.abs()).max(1.0);
-            if !rel_err.is_finite() || rel_err > CONTRACT_GRAD_REL_TOL {
-                return Err(ObjectiveEvalError::contract_violation(format!(
-                    "gradient failed directional finite-difference check at coordinate {axis}: reported={reported:.6e}, finite_diff={fd:.6e}, rel_err={rel_err:.3e}"
-                )));
-            }
-            self.checks.advance();
-        }
-        Ok(cost)
-    }
-}
-
-struct CheckedSecondOrder<ObjFn> {
-    inner: ObjFn,
-    checks: ObjectiveCheckState,
-}
-
-impl<ObjFn> CheckedSecondOrder<ObjFn> {
-    fn new(inner: ObjFn) -> Self {
-        Self {
-            inner,
-            checks: ObjectiveCheckState::new(),
-        }
-    }
-}
-
-impl<ObjFn> SecondOrderObjective for CheckedSecondOrder<ObjFn>
-where
-    ObjFn: SecondOrderObjective,
-{
-    fn eval_grad(
-        &mut self,
-        x: &Array1<f64>,
-        grad_out: &mut Array1<f64>,
-    ) -> Result<f64, ObjectiveEvalError> {
-        grad_out.fill(f64::NAN);
-        let cost = self.inner.eval_grad(x, grad_out)?;
-        if !cost.is_finite() {
-            return Err(ObjectiveEvalError::contract_violation(
-                "objective returned a non-finite cost",
-            ));
-        }
-        if grad_out.iter().any(|value| !value.is_finite()) {
-            return Err(ObjectiveEvalError::contract_violation(
-                "objective returned a gradient with non-finite or unwritten entries",
-            ));
-        }
-        Ok(cost)
-    }
-
-    fn eval_hessian(
-        &mut self,
-        x: &Array1<f64>,
-        grad_out: &mut Array1<f64>,
-        mut hess_out: SymmetricHessianMut<'_>,
-    ) -> Result<f64, ObjectiveEvalError> {
-        grad_out.fill(f64::NAN);
-        hess_out.fill(f64::NAN);
-        let cost = self.inner.eval_hessian(x, grad_out, hess_out.reborrow())?;
-        if !cost.is_finite() {
-            return Err(ObjectiveEvalError::contract_violation(
-                "objective returned a non-finite cost",
-            ));
-        }
-        if grad_out.iter().any(|value| !value.is_finite()) {
-            return Err(ObjectiveEvalError::contract_violation(
-                "objective returned a gradient with non-finite or unwritten entries",
-            ));
-        }
-        if hess_out
-            .as_array()
-            .iter()
-            .any(|value| !value.is_finite())
-        {
-            return Err(ObjectiveEvalError::contract_violation(
-                "objective returned a Hessian with non-finite or unwritten entries",
-            ));
-        }
-        if let Some(axis) = self.checks.next_axis(x.len()) {
-            let eps = finite_difference_step(x[axis]);
-            let mut x_plus = x.clone();
-            let mut x_minus = x.clone();
-            x_plus[axis] += eps;
-            x_minus[axis] -= eps;
-            let mut grad_plus = Array1::from_elem(x.len(), f64::NAN);
-            let mut grad_minus = Array1::from_elem(x.len(), f64::NAN);
-            let f_plus = match self.inner.eval_grad(&x_plus, &mut grad_plus) {
-                Ok(value) => value,
-                Err(err) => {
-                    return Err(ObjectiveEvalError::contract_violation(format!(
-                        "objective failed Hessian contract checking at x + eps*e_{axis}: {err:?}"
-                    )));
-                }
-            };
-            let f_minus = match self.inner.eval_grad(&x_minus, &mut grad_minus) {
-                Ok(value) => value,
-                Err(err) => {
-                    return Err(ObjectiveEvalError::contract_violation(format!(
-                        "objective failed Hessian contract checking at x - eps*e_{axis}: {err:?}"
-                    )));
-                }
-            };
-            if !f_plus.is_finite() || !f_minus.is_finite() {
-                return Err(ObjectiveEvalError::contract_violation(
-                    "objective failed Hessian consistency checking with non-finite costs",
-                ));
-            }
-            if grad_plus.iter().any(|value| !value.is_finite())
-                || grad_minus.iter().any(|value| !value.is_finite())
-            {
-                return Err(ObjectiveEvalError::contract_violation(
-                    "objective failed Hessian consistency checking with non-finite gradients",
-                ));
-            }
-            let fd_grad = (&grad_plus - &grad_minus) / (2.0 * eps);
-            let h_col = hess_out.as_array().column(axis).to_owned();
-            let col_diff = &fd_grad - &h_col;
-            let rel_err = max_abs(&col_diff) / max_abs(&fd_grad).max(max_abs(&h_col)).max(1.0);
-            if !rel_err.is_finite() || rel_err > CONTRACT_HESS_REL_TOL {
-                return Err(ObjectiveEvalError::contract_violation(format!(
-                    "Hessian failed gradient-difference check at coordinate {axis}: rel_err={rel_err:.3e}"
-                )));
-            }
-            let grad_axis = grad_out[axis];
-            let fd_axis = (f_plus - f_minus) / (2.0 * eps);
-            let grad_rel_err = (fd_axis - grad_axis).abs() / fd_axis.abs().max(grad_axis.abs()).max(1.0);
-            if !grad_rel_err.is_finite() || grad_rel_err > CONTRACT_GRAD_REL_TOL {
-                return Err(ObjectiveEvalError::contract_violation(format!(
-                    "gradient failed finite-difference check at coordinate {axis}: reported={grad_axis:.6e}, finite_diff={fd_axis:.6e}, rel_err={grad_rel_err:.3e}"
-                )));
-            }
-            self.checks.advance();
-        }
-        Ok(cost)
-    }
 }
 
 pub struct Problem<ObjFn> {
@@ -1327,7 +1071,8 @@ pub enum AutoSecondOrderError {
     Arc(#[from] ArcError),
 }
 
-trait IntoAutoSolver {
+#[doc(hidden)]
+pub trait IntoAutoSolver {
     type Solver;
 
     fn into_auto_solver(self) -> Self::Solver;
@@ -1337,7 +1082,7 @@ impl<ObjFn> IntoAutoSolver for Problem<ObjFn>
 where
     ObjFn: FirstOrderObjective,
 {
-    type Solver = Bfgs<CheckedFirstOrder<ObjFn>>;
+    type Solver = Bfgs<ObjFn>;
 
     fn into_auto_solver(self) -> Self::Solver {
         let mut solver = Bfgs::new(self.x0, self.objective)
@@ -1355,7 +1100,7 @@ impl<ObjFn> IntoAutoSolver for SecondOrderProblem<ObjFn>
 where
     ObjFn: SecondOrderObjective,
 {
-    type Solver = AutoSecondOrderSolver<CheckedSecondOrder<ObjFn>>;
+    type Solver = AutoSecondOrderSolver<ObjFn>;
 
     fn into_auto_solver(self) -> Self::Solver {
         let SecondOrderProblem {
@@ -1949,7 +1694,7 @@ impl NewtonTrustRegionCore {
                 }
                 return Err(NewtonTrustRegionError::NonFiniteObjective);
             }
-            Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+            Err(ObjectiveEvalError::Fatal { message }) => {
                 return Err(NewtonTrustRegionError::ObjectiveFailed { message });
             }
         };
@@ -2047,7 +1792,7 @@ impl NewtonTrustRegionCore {
                     trust_radius = (trust_radius * 0.2).max(1e-12);
                     continue;
                 }
-                Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+                Err(ObjectiveEvalError::Fatal { message }) => {
                     return Err(NewtonTrustRegionError::ObjectiveFailed { message });
                 }
             };
@@ -2556,7 +2301,7 @@ impl ArcCore {
                 }
                 return Err(ArcError::NonFiniteObjective);
             }
-            Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+            Err(ObjectiveEvalError::Fatal { message }) => {
                 return Err(ArcError::ObjectiveFailed { message });
             }
         };
@@ -2655,7 +2400,7 @@ impl ArcCore {
                         self.escalate_sigma_on_failure(&mut model_failure_streak);
                         continue;
                     }
-                    Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+                    Err(ObjectiveEvalError::Fatal { message }) => {
                         return Err(ArcError::ObjectiveFailed { message });
                     }
                 };
@@ -2732,7 +2477,7 @@ impl ArcCore {
                     self.escalate_sigma_on_failure(&mut model_failure_streak);
                     continue;
                 }
-                Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+                Err(ObjectiveEvalError::Fatal { message }) => {
                     return Err(ArcError::ObjectiveFailed { message });
                 }
             };
@@ -3321,7 +3066,7 @@ impl BfgsCore {
             .map_err(|err| match err {
                 ObjectiveEvalError::Recoverable { message }
                 | ObjectiveEvalError::Fatal { message }
-                | ObjectiveEvalError::ContractViolation { message } => {
+                => {
                     BfgsError::ObjectiveFailed { message }
                 }
             })?;
@@ -3955,7 +3700,7 @@ impl BfgsCore {
                                 ) {
                                     Ok(sample) => sample,
                                     Err(ObjectiveEvalError::Recoverable { .. }) => continue,
-                                    Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+                                    Err(ObjectiveEvalError::Fatal { message }) => {
                                         return Err(BfgsError::ObjectiveFailed { message });
                                     }
                                 };
@@ -4001,7 +3746,7 @@ impl BfgsCore {
                                     Err(ObjectiveEvalError::Recoverable { .. }) => {
                                         (f64::NAN, Array1::zeros(x_scaled.len()))
                                     }
-                                    Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+                                    Err(ObjectiveEvalError::Fatal { message }) => {
                                         return Err(BfgsError::ObjectiveFailed { message });
                                     }
                                 };
@@ -4356,7 +4101,7 @@ impl BfgsCore {
     }
 }
 
-impl<ObjFn> Bfgs<CheckedFirstOrder<ObjFn>>
+impl<ObjFn> Bfgs<ObjFn>
 where
     ObjFn: FirstOrderObjective,
 {
@@ -4368,15 +4113,10 @@ where
     pub fn new(x0: Array1<f64>, obj_fn: ObjFn) -> Self {
         Self {
             core: BfgsCore::new(x0),
-            obj_fn: CheckedFirstOrder::new(obj_fn),
+            obj_fn,
         }
     }
-}
 
-impl<ObjFn> Bfgs<ObjFn>
-where
-    ObjFn: FirstOrderObjective,
-{
     /// Sets the convergence tolerance (default: 1e-5).
     pub fn with_tolerance(mut self, tolerance: Tolerance) -> Self {
         self.core.tolerance = tolerance.get();
@@ -4414,7 +4154,7 @@ where
     }
 }
 
-impl<ObjFn> NewtonTrustRegion<CheckedSecondOrder<ObjFn>>
+impl<ObjFn> NewtonTrustRegion<ObjFn>
 where
     ObjFn: SecondOrderObjective,
 {
@@ -4426,15 +4166,10 @@ where
     pub fn new(x0: Array1<f64>, obj_fn: ObjFn) -> Self {
         Self {
             core: NewtonTrustRegionCore::new(x0),
-            obj_fn: CheckedSecondOrder::new(obj_fn),
+            obj_fn,
         }
     }
-}
 
-impl<ObjFn> NewtonTrustRegion<ObjFn>
-where
-    ObjFn: SecondOrderObjective,
-{
     /// Sets the convergence tolerance on projected gradient norm (default: 1e-5).
     pub fn with_tolerance(mut self, tolerance: Tolerance) -> Self {
         self.core.tolerance = tolerance.get();
@@ -4464,7 +4199,7 @@ where
     }
 }
 
-impl<ObjFn> Arc<CheckedSecondOrder<ObjFn>>
+impl<ObjFn> Arc<ObjFn>
 where
     ObjFn: SecondOrderObjective,
 {
@@ -4476,15 +4211,10 @@ where
     pub fn new(x0: Array1<f64>, obj_fn: ObjFn) -> Self {
         Self {
             core: ArcCore::new(x0),
-            obj_fn: CheckedSecondOrder::new(obj_fn),
+            obj_fn,
         }
     }
-}
 
-impl<ObjFn> Arc<ObjFn>
-where
-    ObjFn: SecondOrderObjective,
-{
     /// Sets the convergence tolerance on projected gradient norm (default: 1e-5).
     pub fn with_tolerance(mut self, tolerance: Tolerance) -> Self {
         self.core.tolerance = tolerance.get();
@@ -4563,7 +4293,7 @@ where
         {
             Ok(f) => f,
             Err(ObjectiveEvalError::Recoverable { .. }) => f64::NAN,
-            Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+            Err(ObjectiveEvalError::Fatal { message }) => {
                 return Err(LineSearchError::ObjectiveFailed(message));
             }
         };
@@ -4665,7 +4395,7 @@ where
                     }
                     continue;
                 }
-                Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+                Err(ObjectiveEvalError::Fatal { message }) => {
                     return Err(LineSearchError::ObjectiveFailed(message));
                 }
             };
@@ -4909,7 +4639,7 @@ where
             match bfgs_eval_cost(oracle, obj_fn, &x_new, &mut func_evals) {
                 Ok(f) => f,
                 Err(ObjectiveEvalError::Recoverable { .. }) => f64::NAN,
-                Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+                Err(ObjectiveEvalError::Fatal { message }) => {
                     return Err(LineSearchError::ObjectiveFailed(message));
                 }
             };
@@ -4949,7 +4679,7 @@ where
                         }
                         continue;
                     }
-                    Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+                    Err(ObjectiveEvalError::Fatal { message }) => {
                         return Err(LineSearchError::ObjectiveFailed(message));
                     }
                 };
@@ -5184,7 +4914,7 @@ where
                 {
                     Ok(sample) => sample,
                     Err(ObjectiveEvalError::Recoverable { .. }) => (f64::NAN, Array1::zeros(x_j.len())),
-                    Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+                    Err(ObjectiveEvalError::Fatal { message }) => {
                         return Err(LineSearchError::ObjectiveFailed(message));
                     }
                 };
@@ -5301,7 +5031,7 @@ where
                     }
                     continue;
                 }
-                Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+                Err(ObjectiveEvalError::Fatal { message }) => {
                     return Err(LineSearchError::ObjectiveFailed(message));
                 }
             };
@@ -5446,7 +5176,7 @@ where
         {
             Ok(f) => f,
             Err(ObjectiveEvalError::Recoverable { .. }) => f64::NAN,
-            Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+            Err(ObjectiveEvalError::Fatal { message }) => {
                 return Err(LineSearchError::ObjectiveFailed(message));
             }
         };
@@ -5502,7 +5232,7 @@ where
                         }
                         continue;
                     }
-                    Err(ObjectiveEvalError::Fatal { message } | ObjectiveEvalError::ContractViolation { message }) => {
+                    Err(ObjectiveEvalError::Fatal { message }) => {
                         return Err(LineSearchError::ObjectiveFailed(message));
                     }
                 };
