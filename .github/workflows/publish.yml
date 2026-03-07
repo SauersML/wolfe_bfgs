@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   publish:
-    name: Publish crate
+    name: Publish crates
     runs-on: ubuntu-22.04
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     env:
@@ -30,5 +30,21 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Publish to crates.io
-        run: cargo publish --locked --token "$CARGO_REGISTRY_TOKEN"
+      - name: Publish `opt`
+        run: cargo publish -p opt --locked --token "$CARGO_REGISTRY_TOKEN"
+
+      - name: Publish `wolfe_bfgs`
+        run: |
+          for attempt in $(seq 1 20); do
+            if cargo publish -p wolfe_bfgs --locked --token "$CARGO_REGISTRY_TOKEN"; then
+              exit 0
+            fi
+
+            if [ "$attempt" -eq 20 ]; then
+              echo "Failed to publish wolfe_bfgs after waiting for crates.io to index opt" >&2
+              exit 1
+            fi
+
+            echo "wolfe_bfgs publish failed; waiting for crates.io to index opt (attempt $attempt/20)"
+            sleep 30
+          done

@@ -42,7 +42,7 @@
 //! Minimize the Rosenbrock function, a classic test case for optimization algorithms.
 //!
 //! ```
-//! use wolfe_bfgs::{optimize, BfgsSolution, FirstOrderObjective, MaxIterations, Problem, Profile, Tolerance};
+//! use opt::{optimize, BfgsSolution, FirstOrderObjective, MaxIterations, Problem, Profile, Tolerance};
 //! use ndarray::{array, Array1};
 //!
 //! struct Rosenbrock;
@@ -52,7 +52,7 @@
 //!         &mut self,
 //!         x: &Array1<f64>,
 //!         grad_out: &mut Array1<f64>,
-//!     ) -> Result<f64, wolfe_bfgs::ObjectiveEvalError> {
+//!     ) -> Result<f64, opt::ObjectiveEvalError> {
 //!         let a = 1.0;
 //!         let b = 100.0;
 //!         let f = (a - x[0]).powi(2) + b * (x[1] - x[0].powi(2)).powi(2);
