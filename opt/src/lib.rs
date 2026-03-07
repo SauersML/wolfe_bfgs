@@ -5431,7 +5431,7 @@ mod tests {
     use spectral::prelude::*;
 
     // --- Test Harness: Python scipy.optimize Comparison Setup ---
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::OnceLock;
     use std::sync::{Arc, Mutex};
@@ -5457,6 +5457,8 @@ mod tests {
         max_iterations: usize,
     ) -> Result<PythonOptResult, String> {
         let python = ensure_python_deps()?;
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let harness = crate_dir.join("optimization_harness.py");
         let input_json = serde_json::json!({
             "x0": x0.to_vec(),
             "function": function_name,
@@ -5465,9 +5467,9 @@ mod tests {
         });
 
         let output = Command::new(python)
-            .arg("optimization_harness.py")
+            .arg(&harness)
             .arg(input_json.to_string())
-            .current_dir(".")
+            .current_dir(&crate_dir)
             .output()
             .map_err(|e| format!("Failed to execute Python script: {}", e))?;
 
@@ -5489,9 +5491,11 @@ mod tests {
         static PYTHON_PATH: OnceLock<Result<String, String>> = OnceLock::new();
         PYTHON_PATH
             .get_or_init(|| {
-                let venv_python = ".venv/bin/python";
-                let python = if Path::new(venv_python).exists() {
-                    venv_python.to_string()
+                let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                let venv_python = crate_dir.join(".venv/bin/python");
+                let venv_python_str = venv_python.display().to_string();
+                let python = if Path::new(&venv_python).exists() {
+                    venv_python_str.clone()
                 } else {
                     "python3".to_string()
                 };
@@ -5506,11 +5510,12 @@ mod tests {
                     return Ok(python);
                 }
 
-                if python != venv_python {
+                if python != venv_python_str {
                     let venv = Command::new("python3")
                         .arg("-m")
                         .arg("venv")
-                        .arg(".venv")
+                        .arg(crate_dir.join(".venv"))
+                        .current_dir(&crate_dir)
                         .output()
                         .map_err(|e| format!("Failed to create venv: {}", e))?;
                     if !venv.status.success() {
@@ -5521,12 +5526,13 @@ mod tests {
                     }
                 }
 
-                let install = Command::new(venv_python)
+                let install = Command::new(&venv_python)
                     .arg("-m")
                     .arg("pip")
                     .arg("install")
                     .arg("numpy")
                     .arg("scipy")
+                    .current_dir(&crate_dir)
                     .output()
                     .map_err(|e| format!("Failed to install numpy/scipy: {}", e))?;
                 if !install.status.success() {
@@ -5536,7 +5542,7 @@ mod tests {
                     ));
                 }
 
-                Ok(venv_python.to_string())
+                Ok(venv_python_str)
             })
             .clone()
     }
