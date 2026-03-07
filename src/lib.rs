@@ -44,19 +44,27 @@
 //! Minimize the Rosenbrock function, a classic test case for optimization algorithms.
 //!
 //! ```
-//! use wolfe_bfgs::{Bfgs, BfgsSolution, BfgsError};
+//! use wolfe_bfgs::{
+//!     Bfgs, BfgsSolution, MaxIterations, ObjectiveRequest, ObjectiveSample, Tolerance,
+//! };
 //! use ndarray::{array, Array1};
 //!
 //! // Define the Rosenbrock function and its gradient.
-//! let rosenbrock = |x: &Array1<f64>| -> (f64, Array1<f64>) {
+//! let rosenbrock = |x: &Array1<f64>, req: ObjectiveRequest| {
 //!     let a = 1.0;
 //!     let b = 100.0;
 //!     let f = (a - x[0]).powi(2) + b * (x[1] - x[0].powi(2)).powi(2);
-//!     let g = array![
-//!         -2.0 * (a - x[0]) - 4.0 * b * (x[1] - x[0].powi(2)) * x[0],
-//!         2.0 * b * (x[1] - x[0].powi(2)),
-//!     ];
-//!     (f, g)
+//!     match req {
+//!         ObjectiveRequest::CostOnly => Ok(ObjectiveSample::cost_only(f)),
+//!         ObjectiveRequest::CostAndGradient => {
+//!             let g = array![
+//!                 -2.0 * (a - x[0]) - 4.0 * b * (x[1] - x[0].powi(2)) * x[0],
+//!                 2.0 * b * (x[1] - x[0].powi(2)),
+//!             ];
+//!             Ok(ObjectiveSample::cost_and_gradient(f, g))
+//!         }
+//!         _ => unreachable!("BFGS only requests cost/gradient"),
+//!     }
 //! };
 //!
 //! // Set the initial guess.
@@ -69,8 +77,8 @@
 //!     iterations,
 //!     ..
 //! } = Bfgs::new(x0, rosenbrock)
-//!     .with_tolerance(1e-6)
-//!     .with_max_iterations(100)
+//!     .with_tolerance(Tolerance::new(1e-6).unwrap())
+//!     .with_max_iterations(MaxIterations::new(100).unwrap())
 //!     .with_fp_tolerances(1e3, 1e2)
 //!     .with_accept_flat_midpoint_once(true)
 //!     .run()
@@ -98,6 +106,70 @@ fn eps_f(fk: f64, tau: f64) -> f64 {
 #[inline]
 fn eps_g(gk: &Array1<f64>, dk: &Array1<f64>, tau: f64) -> f64 {
     tau * EPS * gk.dot(gk).sqrt() * dk.dot(dk).sqrt()
+}
+
+#[inline]
+fn directional_derivative(g: &Array1<f64>, s: &Array1<f64>, alpha: f64, d: &Array1<f64>) -> f64 {
+    if alpha > 0.0 {
+        g.dot(s) / alpha
+    } else {
+        g.dot(d)
+    }
+}
+
+#[inline]
+fn any_free_variables(active: &[bool]) -> bool {
+    active.iter().any(|&is_active| !is_active)
+}
+
+fn mask_vector_inplace(v: &mut Array1<f64>, active: &[bool]) {
+    for (vi, &is_active) in v.iter_mut().zip(active.iter()) {
+        if is_active {
+            *vi = 0.0;
+        }
+    }
+}
+
+fn masked_hv_inplace(h: &Array2<f64>, v: &Array1<f64>, active: &[bool], out: &mut Array1<f64>) {
+    out.fill(0.0);
+    for i in 0..h.nrows() {
+        if active[i] {
+            continue;
+        }
+        let mut accum = 0.0;
+        for j in 0..h.ncols() {
+            if active[j] {
+                continue;
+            }
+            accum += h[[i, j]] * v[j];
+        }
+        out[i] = accum;
+    }
+}
+
+fn bfgs_eval_cost<ObjFn>(
+    oracle: &mut FirstOrderCache,
+    obj_fn: &mut ObjFn,
+    x: &Array1<f64>,
+    func_evals: &mut usize,
+) -> Result<f64, ObjectiveEvalError>
+where
+    ObjFn: FirstOrderObjective,
+{
+    oracle.eval_cost(obj_fn, x, func_evals)
+}
+
+fn bfgs_eval_cost_grad<ObjFn>(
+    oracle: &mut FirstOrderCache,
+    obj_fn: &mut ObjFn,
+    x: &Array1<f64>,
+    func_evals: &mut usize,
+    grad_evals: &mut usize,
+) -> Result<(f64, Array1<f64>), ObjectiveEvalError>
+where
+    ObjFn: FirstOrderObjective,
+{
+    oracle.eval_cost_grad(obj_fn, x, func_evals, grad_evals)
 }
 
 // Ring buffer for GLL nonmonotone Armijo (internal only)
@@ -162,20 +234,32 @@ impl ProbeBest {
     }
 }
 
+struct CgResult {
+    x: Array1<f64>,
+    rel_resid: f64,
+}
+
 // Conjugate gradient solve for (A + ridge*I) x = b; avoids dense factorizations.
-fn cg_solve(
+fn cg_solve_from(
     a: &Array2<f64>,
     b: &Array1<f64>,
+    x0: Array1<f64>,
     max_iter: usize,
     tol: f64,
     ridge: f64,
-) -> Option<Array1<f64>> {
+) -> Option<CgResult> {
     let n = a.nrows();
     if a.ncols() != n || b.len() != n {
         return None;
     }
-    let mut x = Array1::<f64>::zeros(n);
-    let mut r = b.clone();
+    let mut x = x0;
+    let mut ax = a.dot(&x);
+    if ridge > 0.0 {
+        for i in 0..n {
+            ax[i] += ridge * x[i];
+        }
+    }
+    let mut r = b - &ax;
     let mut p = r.clone();
     let mut rs_old = r.dot(&r);
     if !rs_old.is_finite() {
@@ -183,6 +267,12 @@ fn cg_solve(
     }
     let b_norm = b.dot(b).sqrt().max(1.0);
     let tol_abs = tol * b_norm;
+    if rs_old.sqrt() <= tol_abs {
+        return Some(CgResult {
+            x,
+            rel_resid: rs_old.sqrt() / b_norm,
+        });
+    }
     for _ in 0..max_iter {
         let mut ap = a.dot(&p);
         if ridge > 0.0 {
@@ -198,20 +288,100 @@ fn cg_solve(
         if !alpha.is_finite() {
             return None;
         }
-        x = &x + &(alpha * &p);
-        r = &r - &(alpha * &ap);
+        x.scaled_add(alpha, &p);
+        r.scaled_add(-alpha, &ap);
         let rs_new = r.dot(&r);
         if !rs_new.is_finite() {
             return None;
         }
         if rs_new.sqrt() <= tol_abs {
-            return Some(x);
+            return Some(CgResult {
+                x,
+                rel_resid: rs_new.sqrt() / b_norm,
+            });
         }
         let beta = rs_new / rs_old;
-        p = &r + &(beta * &p);
+        p *= beta;
+        p += &r;
         rs_old = rs_new;
     }
-    Some(x)
+    Some(CgResult {
+        x,
+        rel_resid: rs_old.sqrt() / b_norm,
+    })
+}
+
+fn dense_solve_shifted(a: &Array2<f64>, b: &Array1<f64>, ridge: f64) -> Option<Array1<f64>> {
+    let n = a.nrows();
+    if a.ncols() != n || b.len() != n {
+        return None;
+    }
+    let mut mat = a.clone();
+    if ridge > 0.0 {
+        for i in 0..n {
+            mat[[i, i]] += ridge;
+        }
+    }
+    let mut rhs = b.clone();
+
+    for k in 0..n {
+        let mut pivot_row = k;
+        let mut pivot_abs = mat[[k, k]].abs();
+        for i in (k + 1)..n {
+            let cand = mat[[i, k]].abs();
+            if cand > pivot_abs {
+                pivot_abs = cand;
+                pivot_row = i;
+            }
+        }
+        if !pivot_abs.is_finite() || pivot_abs <= 1e-14 {
+            return None;
+        }
+        if pivot_row != k {
+            for j in k..n {
+                let tmp = mat[[k, j]];
+                mat[[k, j]] = mat[[pivot_row, j]];
+                mat[[pivot_row, j]] = tmp;
+            }
+            let tmp_rhs = rhs[k];
+            rhs[k] = rhs[pivot_row];
+            rhs[pivot_row] = tmp_rhs;
+        }
+
+        let pivot = mat[[k, k]];
+        for i in (k + 1)..n {
+            let factor = mat[[i, k]] / pivot;
+            mat[[i, k]] = 0.0;
+            for j in (k + 1)..n {
+                mat[[i, j]] -= factor * mat[[k, j]];
+            }
+            rhs[i] -= factor * rhs[k];
+        }
+    }
+
+    let mut x = Array1::<f64>::zeros(n);
+    for ii in 0..n {
+        let i = n - 1 - ii;
+        let mut sum = rhs[i];
+        for j in (i + 1)..n {
+            sum -= mat[[i, j]] * x[j];
+        }
+        let diag = mat[[i, i]];
+        if !diag.is_finite() || diag.abs() <= 1e-14 {
+            return None;
+        }
+        x[i] = sum / diag;
+    }
+    if x.iter().all(|v| v.is_finite()) {
+        Some(x)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn prefer_dense_direct(n: usize) -> bool {
+    n <= 128
 }
 
 // Adaptive CG iteration cap: full solve for small n, capped growth for large n.
@@ -225,20 +395,6 @@ fn cg_iter_cap(n: usize, base: usize) -> usize {
     }
 }
 
-fn cg_residual_rel(a: &Array2<f64>, x: &Array1<f64>, b: &Array1<f64>, ridge: f64) -> f64 {
-    let n = a.nrows();
-    let mut ax = a.dot(x);
-    if ridge > 0.0 {
-        for i in 0..n {
-            ax[i] += ridge * x[i];
-        }
-    }
-    let r = b - &ax;
-    let r_norm = r.dot(&r).sqrt();
-    let b_norm = b.dot(b).sqrt().max(1.0);
-    r_norm / b_norm
-}
-
 // Adaptive CG: retry with a higher cap/tighter tol if residual is too large.
 fn cg_solve_adaptive(
     a: &Array2<f64>,
@@ -248,18 +404,21 @@ fn cg_solve_adaptive(
     ridge: f64,
 ) -> Option<Array1<f64>> {
     let n = a.nrows();
+    if prefer_dense_direct(n) {
+        return dense_solve_shifted(a, b, ridge);
+    }
     let cap1 = cg_iter_cap(n, base_iter);
-    let x1 = cg_solve(a, b, cap1, tol, ridge)?;
-    let rel1 = cg_residual_rel(a, &x1, b, ridge);
-    if rel1.is_finite() && rel1 <= tol * 10.0 {
-        return Some(x1);
+    let stage1 = cg_solve_from(a, b, Array1::<f64>::zeros(n), cap1, tol, ridge)?;
+    if stage1.rel_resid.is_finite() && stage1.rel_resid <= tol * 10.0 {
+        return Some(stage1.x);
     }
     let cap2 = cg_iter_cap(n, base_iter.saturating_mul(2));
     if cap2 <= cap1 {
-        return Some(x1);
+        return Some(stage1.x);
     }
-    let x2 = cg_solve(a, b, cap2, tol * 0.1, ridge)?;
-    Some(x2)
+    let refine_iters = cap2.saturating_sub(cap1).max(1);
+    let stage2 = cg_solve_from(a, b, stage1.x, refine_iters, tol * 0.1, ridge)?;
+    Some(stage2.x)
 }
 
 // Helper: return a scaled identity matrix (lambda * I_n).
@@ -267,17 +426,63 @@ fn scaled_identity(n: usize, lambda: f64) -> Array2<f64> {
     Array2::<f64>::eye(n) * lambda
 }
 
-fn symmetrize(a: &Array2<f64>) -> Array2<f64> {
+fn hessian_is_effectively_symmetric(a: &Array2<f64>) -> bool {
     let n = a.nrows();
-    let mut out = a.clone();
+    let mut max_skew = 0.0f64;
+    let mut scale = 0.0f64;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let aij = a[[i, j]];
+            let aji = a[[j, i]];
+            max_skew = max_skew.max((aij - aji).abs());
+            scale = scale.max(aij.abs()).max(aji.abs());
+        }
+    }
+    max_skew <= 1e-12 * (1.0 + scale)
+}
+
+fn symmetrize_into(workspace: &mut Array2<f64>, a: &Array2<f64>) {
+    workspace.assign(a);
+    let n = a.nrows();
     for i in 0..n {
         for j in (i + 1)..n {
             let v = 0.5 * (a[[i, j]] + a[[j, i]]);
-            out[[i, j]] = v;
-            out[[j, i]] = v;
+            workspace[[i, j]] = v;
+            workspace[[j, i]] = v;
         }
     }
-    out
+}
+
+fn has_finite_positive_diagonal(a: &Array2<f64>) -> bool {
+    for i in 0..a.nrows() {
+        let diag = a[[i, i]];
+        if !diag.is_finite() || diag <= 0.0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn apply_inverse_bfgs_update_in_place(
+    h_inv: &mut Array2<f64>,
+    s: &Array1<f64>,
+    y: &Array1<f64>,
+    backup: &mut Array2<f64>,
+) -> bool {
+    backup.assign(h_inv);
+    let rho = 1.0 / s.dot(y);
+    let hy = backup.dot(y);
+    let yhy = y.dot(&hy);
+    let coeff = (1.0 + yhy * rho) * rho;
+    let n = h_inv.nrows();
+    for i in 0..n {
+        for j in i..n {
+            let v = backup[[i, j]] + coeff * s[i] * s[j] - rho * (hy[i] * s[j] + s[i] * hy[j]);
+            h_inv[[i, j]] = v;
+            h_inv[[j, i]] = v;
+        }
+    }
+    has_finite_positive_diagonal(h_inv)
 }
 
 // Box constraints with projection and active-set tolerance.
@@ -336,6 +541,40 @@ impl BoxSpec {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum BoundsError {
+    #[error("lower/upper lengths differ")]
+    DimensionMismatch,
+    #[error("lower bound exceeds upper bound at index {index}")]
+    InvertedInterval { index: usize },
+    #[error("bound tolerance must be finite and >= 0")]
+    InvalidTolerance,
+}
+
+#[derive(Clone)]
+pub struct Bounds {
+    spec: BoxSpec,
+}
+
+impl Bounds {
+    pub fn new(lower: Array1<f64>, upper: Array1<f64>, tol: f64) -> Result<Self, BoundsError> {
+        if lower.len() != upper.len() {
+            return Err(BoundsError::DimensionMismatch);
+        }
+        for i in 0..lower.len() {
+            if lower[i] > upper[i] {
+                return Err(BoundsError::InvertedInterval { index: i });
+            }
+        }
+        if !tol.is_finite() || tol < 0.0 {
+            return Err(BoundsError::InvalidTolerance);
+        }
+        Ok(Self {
+            spec: BoxSpec::new(lower, upper, tol),
+        })
+    }
+}
+
 // An enum to manage the adaptive strategy.
 #[derive(Debug, Clone, Copy)]
 enum LineSearchStrategy {
@@ -358,6 +597,7 @@ enum AcceptKind {
 enum LineSearchError {
     MaxAttempts(usize),
     StepSizeTooSmall,
+    ObjectiveFailed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,10 +613,10 @@ const BACKTRACKING_MAX_ATTEMPTS: usize = 50;
 /// An error type for clear diagnostics.
 #[derive(Debug, thiserror::Error)]
 pub enum BfgsError {
-    #[error("Invalid bounds: {message}")]
-    InvalidBounds { message: String },
     #[error("Internal invariant violated: {message}")]
     InternalInvariant { message: String },
+    #[error("Objective evaluation failed: {message}")]
+    ObjectiveFailed { message: String },
     #[error(
         "The line search failed ({failure_reason:?}) after {max_attempts} attempts. The optimization landscape may be pathological."
     )]
@@ -403,6 +643,153 @@ pub enum BfgsError {
     StepSizeTooSmall,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("tolerance must be finite and > 0")]
+    InvalidTolerance,
+    #[error("max_iterations must be >= 1")]
+    InvalidMaxIterations,
+    #[error("radius must be finite and > 0")]
+    InvalidRadius,
+    #[error("sigma must be finite and > 0")]
+    InvalidSigma,
+    #[error("eta must be finite and in [0, 0.9]")]
+    InvalidNewtonAcceptance,
+    #[error("ARC acceptance thresholds must satisfy 0 <= eta1 < eta2 < 1")]
+    InvalidArcAcceptance,
+    #[error("sigma update factors must satisfy 0 < gamma1 < 1 < gamma2 <= gamma3")]
+    InvalidSigmaUpdate,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Tolerance(f64);
+
+impl Tolerance {
+    pub fn new(value: f64) -> Result<Self, ConfigError> {
+        if value.is_finite() && value > 0.0 {
+            Ok(Self(value))
+        } else {
+            Err(ConfigError::InvalidTolerance)
+        }
+    }
+
+    fn get(self) -> f64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MaxIterations(usize);
+
+impl MaxIterations {
+    pub fn new(value: usize) -> Result<Self, ConfigError> {
+        if value >= 1 {
+            Ok(Self(value))
+        } else {
+            Err(ConfigError::InvalidMaxIterations)
+        }
+    }
+
+    fn get(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TrustRegionRadius(f64);
+
+impl TrustRegionRadius {
+    pub fn new(value: f64) -> Result<Self, ConfigError> {
+        if value.is_finite() && value > 0.0 {
+            Ok(Self(value))
+        } else {
+            Err(ConfigError::InvalidRadius)
+        }
+    }
+
+    fn get(self) -> f64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SigmaValue(f64);
+
+impl SigmaValue {
+    pub fn new(value: f64) -> Result<Self, ConfigError> {
+        if value.is_finite() && value > 0.0 {
+            Ok(Self(value))
+        } else {
+            Err(ConfigError::InvalidSigma)
+        }
+    }
+
+    fn get(self) -> f64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewtonAcceptance(f64);
+
+impl NewtonAcceptance {
+    pub fn new(value: f64) -> Result<Self, ConfigError> {
+        if value.is_finite() && (0.0..=0.9).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(ConfigError::InvalidNewtonAcceptance)
+        }
+    }
+
+    fn get(self) -> f64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ArcAcceptance {
+    eta1: f64,
+    eta2: f64,
+}
+
+impl ArcAcceptance {
+    pub fn new(eta1: f64, eta2: f64) -> Result<Self, ConfigError> {
+        if eta1.is_finite() && eta2.is_finite() && eta1 >= 0.0 && eta1 < eta2 && eta2 < 1.0 {
+            Ok(Self { eta1, eta2 })
+        } else {
+            Err(ConfigError::InvalidArcAcceptance)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SigmaUpdate {
+    gamma1: f64,
+    gamma2: f64,
+    gamma3: f64,
+}
+
+impl SigmaUpdate {
+    pub fn new(gamma1: f64, gamma2: f64, gamma3: f64) -> Result<Self, ConfigError> {
+        if gamma1.is_finite()
+            && gamma2.is_finite()
+            && gamma3.is_finite()
+            && gamma1 > 0.0
+            && gamma1 < 1.0
+            && gamma2 > 1.0
+            && gamma2 <= gamma3
+        {
+            Ok(Self {
+                gamma1,
+                gamma2,
+                gamma3,
+            })
+        } else {
+            Err(ConfigError::InvalidSigmaUpdate)
+        }
+    }
+}
+
 /// A summary of a successful optimization run.
 ///
 /// Note that for non-convex functions, convergence to a local minimum is not guaranteed.
@@ -420,14 +807,6 @@ pub struct BfgsSolution {
     pub func_evals: usize,
     /// The total number of times the gradient was evaluated.
     pub grad_evals: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectiveRequest {
-    CostOnly,
-    CostAndGradient,
-    GradientAndHessian,
-    CostGradientHessian,
 }
 
 #[derive(Debug, Clone)]
@@ -454,42 +833,196 @@ impl ObjectiveEvalError {
     }
 }
 
-pub struct ObjectiveSample {
-    pub cost: f64,
-    pub gradient: Option<Array1<f64>>,
-    pub hessian: Option<Array2<f64>>,
+pub trait FirstOrderObjective {
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError>;
+
+    fn eval_cost_grad(&mut self, x: &Array1<f64>) -> Result<(f64, Array1<f64>), ObjectiveEvalError>;
 }
 
-impl ObjectiveSample {
-    pub fn cost_only(cost: f64) -> Self {
+pub trait SecondOrderObjective: FirstOrderObjective {
+    fn eval_cost_grad_hessian(
+        &mut self,
+        x: &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), ObjectiveEvalError>;
+}
+
+impl<F> FirstOrderObjective for F
+where
+    F: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
+{
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        Ok((self)(x).0)
+    }
+
+    fn eval_cost_grad(&mut self, x: &Array1<f64>) -> Result<(f64, Array1<f64>), ObjectiveEvalError> {
+        Ok((self)(x))
+    }
+}
+
+impl<F> SecondOrderObjective for F
+where
+    F: FnMut(&Array1<f64>) -> (f64, Array1<f64>, Array2<f64>),
+{
+    fn eval_cost_grad_hessian(
+        &mut self,
+        x: &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), ObjectiveEvalError> {
+        Ok((self)(x))
+    }
+}
+
+impl<F> FirstOrderObjective for F
+where
+    F: FnMut(&Array1<f64>) -> (f64, Array1<f64>, Array2<f64>),
+{
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        Ok((self)(x).0)
+    }
+
+    fn eval_cost_grad(
+        &mut self,
+        x: &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>), ObjectiveEvalError> {
+        let (f, g, _) = (self)(x);
+        Ok((f, g))
+    }
+}
+
+struct BorrowedFirstOrder<'a, O> {
+    inner: &'a mut O,
+}
+
+impl<'a, O> BorrowedFirstOrder<'a, O> {
+    fn new(inner: &'a mut O) -> Self {
+        Self { inner }
+    }
+}
+
+impl<O> FirstOrderObjective for BorrowedFirstOrder<'_, O>
+where
+    O: FirstOrderObjective,
+{
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        self.inner.eval_cost(x)
+    }
+
+    fn eval_cost_grad(&mut self, x: &Array1<f64>) -> Result<(f64, Array1<f64>), ObjectiveEvalError> {
+        self.inner.eval_cost_grad(x)
+    }
+}
+
+struct FirstOrderCache {
+    last_x: Option<Array1<f64>>,
+    last_cost: Option<f64>,
+    last_grad: Option<Array1<f64>>,
+}
+
+impl FirstOrderCache {
+    fn new() -> Self {
         Self {
-            cost,
-            gradient: None,
-            hessian: None,
+            last_x: None,
+            last_cost: None,
+            last_grad: None,
         }
     }
 
-    pub fn cost_and_gradient(cost: f64, gradient: Array1<f64>) -> Self {
+    fn eval_cost<ObjFn>(
+        &mut self,
+        obj_fn: &mut ObjFn,
+        x: &Array1<f64>,
+        func_evals: &mut usize,
+    ) -> Result<f64, ObjectiveEvalError>
+    where
+        ObjFn: FirstOrderObjective,
+    {
+        if let (Some(last_x), Some(last_cost)) = (&self.last_x, self.last_cost)
+            && last_x == x
+        {
+            return Ok(last_cost);
+        }
+        let cost = obj_fn.eval_cost(x)?;
+        *func_evals += 1;
+        self.last_x = Some(x.clone());
+        self.last_cost = Some(cost);
+        Ok(cost)
+    }
+
+    fn eval_cost_grad<ObjFn>(
+        &mut self,
+        obj_fn: &mut ObjFn,
+        x: &Array1<f64>,
+        func_evals: &mut usize,
+        grad_evals: &mut usize,
+    ) -> Result<(f64, Array1<f64>), ObjectiveEvalError>
+    where
+        ObjFn: FirstOrderObjective,
+    {
+        if let (Some(last_x), Some(last_cost), Some(last_grad)) =
+            (&self.last_x, self.last_cost, &self.last_grad)
+            && last_x == x
+        {
+            return Ok((last_cost, last_grad.clone()));
+        }
+        let (cost, grad) = obj_fn.eval_cost_grad(x)?;
+        *func_evals += 1;
+        *grad_evals += 1;
+        self.last_x = Some(x.clone());
+        self.last_cost = Some(cost);
+        self.last_grad = Some(grad.clone());
+        Ok((cost, grad))
+    }
+}
+
+struct SecondOrderCache {
+    last_x: Option<Array1<f64>>,
+    last_cost: Option<f64>,
+    last_grad: Option<Array1<f64>>,
+    last_hessian: Option<Array2<f64>>,
+}
+
+impl SecondOrderCache {
+    fn new() -> Self {
         Self {
-            cost,
-            gradient: Some(gradient),
-            hessian: None,
+            last_x: None,
+            last_cost: None,
+            last_grad: None,
+            last_hessian: None,
         }
     }
 
-    pub fn cost_gradient_hessian(cost: f64, gradient: Array1<f64>, hessian: Array2<f64>) -> Self {
-        Self {
-            cost,
-            gradient: Some(gradient),
-            hessian: Some(hessian),
+    fn eval_cost_grad_hessian<ObjFn>(
+        &mut self,
+        obj_fn: &mut ObjFn,
+        x: &Array1<f64>,
+        func_evals: &mut usize,
+        grad_evals: &mut usize,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), ObjectiveEvalError>
+    where
+        ObjFn: SecondOrderObjective,
+    {
+        if let (Some(last_x), Some(last_cost), Some(last_grad), Some(last_hessian)) = (
+            &self.last_x,
+            self.last_cost,
+            &self.last_grad,
+            &self.last_hessian,
+        ) && last_x == x
+        {
+            return Ok((last_cost, last_grad.clone(), last_hessian.clone()));
         }
+
+        let (cost, grad, hessian) = obj_fn.eval_cost_grad_hessian(x)?;
+        *func_evals += 1;
+        *grad_evals += 1;
+        self.last_x = Some(x.clone());
+        self.last_cost = Some(cost);
+        self.last_grad = Some(grad.clone());
+        self.last_hessian = Some(hessian.clone());
+        Ok((cost, grad, hessian))
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum NewtonTrustRegionError {
-    #[error("Invalid bounds: {message}")]
-    InvalidBounds { message: String },
     #[error(
         "Objective returned a Hessian with shape {got_rows}x{got_cols}; expected {expected}x{expected}"
     )]
@@ -515,7 +1048,6 @@ struct NewtonTrustRegionCore {
     tolerance: f64,
     max_iterations: usize,
     bounds: Option<BoxSpec>,
-    config_error: Option<String>,
     trust_radius: f64,
     trust_radius_max: f64,
     eta_accept: f64,
@@ -530,8 +1062,6 @@ pub struct NewtonTrustRegion<ObjFn> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArcError {
-    #[error("Invalid bounds: {message}")]
-    InvalidBounds { message: String },
     #[error(
         "Objective returned a Hessian with shape {got_rows}x{got_cols}; expected {expected}x{expected}"
     )]
@@ -557,7 +1087,6 @@ struct ArcCore {
     tolerance: f64,
     max_iterations: usize,
     bounds: Option<BoxSpec>,
-    config_error: Option<String>,
     theta: f64,
     sigma: f64,
     sigma_min: f64,
@@ -585,7 +1114,6 @@ impl NewtonTrustRegionCore {
             tolerance: 1e-5,
             max_iterations: 100,
             bounds: None,
-            config_error: None,
             trust_radius: 1.0,
             trust_radius_max: 1e6,
             eta_accept: 0.1,
@@ -654,28 +1182,60 @@ impl NewtonTrustRegionCore {
         h_model: &Array2<f64>,
         g_proj: &Array1<f64>,
         trust_radius: f64,
+        active: Option<&[bool]>,
     ) -> Option<(Array1<f64>, f64)> {
         let n = g_proj.len();
         let g_norm = g_proj.dot(g_proj).sqrt();
         if !g_norm.is_finite() || g_norm <= 0.0 {
             return None;
         }
+        let active = active.unwrap_or(&[]);
+        let use_mask = !active.is_empty();
+        if use_mask && !any_free_variables(active) {
+            return None;
+        }
+        if !use_mask && prefer_dense_direct(n) {
+            let mean_diag = (0..n).map(|i| h_model[[i, i]].abs()).sum::<f64>() / (n as f64);
+            let ridge = (1e-14 * mean_diag).max(0.0);
+            let rhs = -g_proj.clone();
+            if let Some(p_newton) = dense_solve_shifted(h_model, &rhs, ridge) {
+                let p_norm = p_newton.dot(&p_newton).sqrt();
+                if p_norm.is_finite() && p_norm <= trust_radius {
+                    let pred = Self::predicted_decrease(h_model, g_proj, &p_newton);
+                    if pred.is_finite() && pred > 0.0 {
+                        return Some((p_newton, pred));
+                    }
+                }
+            }
+        }
 
         let mut p = Array1::<f64>::zeros(n);
         let mut r = g_proj.clone();
+        if use_mask {
+            mask_vector_inplace(&mut r, active);
+        }
         let mut d = r.mapv(|v| -v);
+        if use_mask {
+            mask_vector_inplace(&mut d, active);
+        }
         let mut rtr = r.dot(&r);
         let cg_tol = (1e-6 * g_norm).max(1e-12);
         let max_iter = (2 * n).max(10);
+        let mut bd = Array1::<f64>::zeros(n);
 
         for _ in 0..max_iter {
-            let bd = h_model.dot(&d);
+            if use_mask {
+                masked_hv_inplace(h_model, &d, active, &mut bd);
+            } else {
+                bd.assign(&h_model.dot(&d));
+            }
             let d_bd = d.dot(&bd);
 
             // Negative/near-zero curvature: move to trust-region boundary along d.
             if !d_bd.is_finite() || d_bd <= 1e-14 * d.dot(&d).max(1.0) {
                 let tau = Self::boundary_tau(&p, &d, trust_radius)?;
-                let p_nc = &p + &(d * tau);
+                let mut p_nc = p.clone();
+                p_nc.scaled_add(tau, &d);
                 let pred = Self::predicted_decrease(h_model, g_proj, &p_nc);
                 if pred.is_finite() && pred > 0.0 {
                     return Some((p_nc, pred));
@@ -688,11 +1248,13 @@ impl NewtonTrustRegionCore {
                 break;
             }
 
-            let p_next = &p + &(d.clone() * alpha);
+            let mut p_next = p.clone();
+            p_next.scaled_add(alpha, &d);
             let p_next_norm = p_next.dot(&p_next).sqrt();
             if p_next_norm >= trust_radius {
                 let tau = Self::boundary_tau(&p, &d, trust_radius)?;
-                let p_b = &p + &(d * tau);
+                let mut p_b = p.clone();
+                p_b.scaled_add(tau, &d);
                 let pred = Self::predicted_decrease(h_model, g_proj, &p_b);
                 if pred.is_finite() && pred > 0.0 {
                     return Some((p_b, pred));
@@ -700,8 +1262,8 @@ impl NewtonTrustRegionCore {
                 break;
             }
 
-            let r_next = &r + &(bd * alpha);
-            let r_next_norm = r_next.dot(&r_next).sqrt();
+            r.scaled_add(alpha, &bd);
+            let r_next_norm = r.dot(&r).sqrt();
             if !r_next_norm.is_finite() {
                 break;
             }
@@ -715,20 +1277,24 @@ impl NewtonTrustRegionCore {
                 break;
             }
 
-            let rtr_next = r_next.dot(&r_next);
+            let rtr_next = r.dot(&r);
             let beta = rtr_next / rtr;
             if !beta.is_finite() || beta < 0.0 {
                 break;
             }
-            d = r_next.mapv(|v| -v) + d * beta;
-            r = r_next;
+            d *= beta;
+            d -= &r;
+            if use_mask {
+                mask_vector_inplace(&mut d, active);
+            }
             rtr = rtr_next;
         }
 
         // Conservative fallback: steepest-descent boundary step.
         let g_norm2 = g_proj.dot(g_proj);
         if g_norm2.is_finite() && g_norm2 > 0.0 {
-            let p_sd = g_proj.mapv(|v| -(trust_radius / g_norm2.sqrt()) * v);
+            let mut p_sd = g_proj.clone();
+            p_sd *= -(trust_radius / g_norm2.sqrt());
             let pred = Self::predicted_decrease(h_model, g_proj, &p_sd);
             if pred.is_finite() && pred > 0.0 {
                 return Some((p_sd, pred));
@@ -737,38 +1303,13 @@ impl NewtonTrustRegionCore {
         None
     }
 
-    fn extract_subspace(
-        &self,
-        h: &Array2<f64>,
-        g: &Array1<f64>,
-        free_idx: &[usize],
-    ) -> (Array2<f64>, Array1<f64>) {
-        let m = free_idx.len();
-        let mut h_sub = Array2::<f64>::zeros((m, m));
-        let mut g_sub = Array1::<f64>::zeros(m);
-        for (ii, &i) in free_idx.iter().enumerate() {
-            g_sub[ii] = g[i];
-            for (jj, &j) in free_idx.iter().enumerate() {
-                h_sub[[ii, jj]] = h[[i, j]];
-            }
-        }
-        (h_sub, g_sub)
-    }
-
-    fn expand_step(&self, n: usize, free_idx: &[usize], step_sub: &Array1<f64>) -> Array1<f64> {
-        let mut step = Array1::<f64>::zeros(n);
-        for (ii, &i) in free_idx.iter().enumerate() {
-            step[i] = step_sub[ii];
-        }
-        step
-    }
-
     fn warm_inverse_from_history(
         &self,
         n: usize,
         history: &VecDeque<(Array1<f64>, Array1<f64>)>,
     ) -> Array2<f64> {
         let mut h_inv = Array2::<f64>::eye(n);
+        let mut backup = Array2::<f64>::zeros((n, n));
         if let Some((s_last, y_last)) = history.back() {
             let sy = s_last.dot(y_last);
             let yy = y_last.dot(y_last);
@@ -782,33 +1323,8 @@ impl NewtonTrustRegionCore {
             if !sty.is_finite() || sty <= 1e-12 {
                 continue;
             }
-            let rho = 1.0 / sty;
-            let hy = h_inv.dot(y);
-            let yhy = y.dot(&hy);
-            let coeff = (1.0 + yhy * rho) * rho;
-            let old = h_inv.clone();
-            for i in 0..n {
-                for j in 0..n {
-                    h_inv[[i, j]] += coeff * s[i] * s[j] - rho * (hy[i] * s[j] + s[i] * hy[j]);
-                }
-            }
-            // Symmetrize and keep diagonal sane
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    let v = 0.5 * (h_inv[[i, j]] + h_inv[[j, i]]);
-                    h_inv[[i, j]] = v;
-                    h_inv[[j, i]] = v;
-                }
-            }
-            let mut bad = false;
-            for i in 0..n {
-                if !h_inv[[i, i]].is_finite() || h_inv[[i, i]] <= 0.0 {
-                    bad = true;
-                    break;
-                }
-            }
-            if bad {
-                h_inv = old;
+            if !apply_inverse_bfgs_update_in_place(&mut h_inv, s, y, &mut backup) {
+                h_inv.assign(&backup);
             }
         }
         h_inv
@@ -824,55 +1340,38 @@ impl NewtonTrustRegionCore {
         mut grad_evals: usize,
     ) -> Result<BfgsSolution, NewtonTrustRegionError>
     where
-        ObjFn: FnMut(&Array1<f64>, ObjectiveRequest) -> Result<ObjectiveSample, ObjectiveEvalError>,
+        ObjFn: SecondOrderObjective,
     {
+        eprintln!(
+            "[OPT-TRACE] NewtonTrustRegion -> BFGS fallback (iter_used={}, dim={})",
+            iter_used,
+            x_start.len()
+        );
         let n = x_start.len();
         let h0_inv = self.warm_inverse_from_history(n, history);
-        let lower_upper = self
-            .bounds
-            .as_ref()
-            .map(|b| (b.lower.clone(), b.upper.clone(), b.tol));
+        let bounds = self.bounds.as_ref().map(|b| Bounds { spec: b.clone() });
 
-        let mut fatal_error: Option<String> = None;
-        let mut bfgs = Bfgs::new(x_start, |x| {
-            match obj_fn(x, ObjectiveRequest::CostAndGradient) {
-                Ok(sample) => match sample.gradient {
-                    Some(g) if sample.cost.is_finite() && g.iter().all(|v| v.is_finite()) => {
-                        (sample.cost, g)
-                    }
-                    _ => (f64::INFINITY, Array1::<f64>::from_elem(x.len(), f64::NAN)),
-                },
-                Err(ObjectiveEvalError::Recoverable { .. }) => {
-                    (f64::INFINITY, Array1::<f64>::from_elem(x.len(), f64::NAN))
-                }
-                Err(ObjectiveEvalError::Fatal { message }) => {
-                    fatal_error = Some(message);
-                    (f64::INFINITY, Array1::<f64>::from_elem(x.len(), f64::NAN))
-                }
-            }
-        })
-        .with_tolerance(self.tolerance)
-        .with_max_iterations(self.max_iterations.saturating_sub(iter_used).max(1))
+        let mut bfgs = Bfgs::new(x_start, BorrowedFirstOrder::new(obj_fn))
+        .with_tolerance(Tolerance::new(self.tolerance).expect("core tolerance must be valid"))
+        .with_max_iterations(
+            MaxIterations::new(self.max_iterations.saturating_sub(iter_used).max(1))
+                .expect("core max_iterations must be valid"),
+        )
         .with_initial_inverse_hessian(h0_inv);
 
-        if let Some((lower, upper, tol)) = lower_upper {
-            bfgs = bfgs.with_bounds(lower, upper, tol);
+        if let Some(bounds) = bounds {
+            bfgs = bfgs.with_bounds(bounds);
         }
 
         let fallback_sol = match bfgs.run() {
             Ok(sol) => sol,
             Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
             Err(BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
-            Err(_) => {
-                if let Some(message) = fatal_error {
-                    return Err(NewtonTrustRegionError::ObjectiveFailed { message });
-                }
-                return Err(NewtonTrustRegionError::ModelHessianNotSpd);
+            Err(BfgsError::ObjectiveFailed { message }) => {
+                return Err(NewtonTrustRegionError::ObjectiveFailed { message });
             }
+            Err(_) => return Err(NewtonTrustRegionError::ModelHessianNotSpd),
         };
-        if let Some(message) = fatal_error {
-            return Err(NewtonTrustRegionError::ObjectiveFailed { message });
-        }
         func_evals += fallback_sol.func_evals;
         grad_evals += fallback_sol.grad_evals;
         Ok(BfgsSolution {
@@ -887,35 +1386,18 @@ impl NewtonTrustRegionCore {
 
     fn run<ObjFn>(&mut self, obj_fn: &mut ObjFn) -> Result<BfgsSolution, NewtonTrustRegionError>
     where
-        ObjFn: FnMut(&Array1<f64>, ObjectiveRequest) -> Result<ObjectiveSample, ObjectiveEvalError>,
+        ObjFn: SecondOrderObjective,
     {
-        if let Some(message) = self.config_error.clone() {
-            return Err(NewtonTrustRegionError::InvalidBounds { message });
-        }
         let n = self.x0.len();
         let mut x_k = self.project_point(&self.x0);
-        let initial = obj_fn(&x_k, ObjectiveRequest::CostGradientHessian);
-        let mut func_evals = 1usize;
-        let mut grad_evals = 1usize;
+        let mut func_evals = 0usize;
+        let mut grad_evals = 0usize;
+        let mut oracle = SecondOrderCache::new();
+        let initial = oracle.eval_cost_grad_hessian(obj_fn, &x_k, &mut func_evals, &mut grad_evals);
         let mut history: VecDeque<(Array1<f64>, Array1<f64>)> =
             VecDeque::with_capacity(self.history_cap.max(2));
         let (mut f_k, mut g_k, mut h_k) = match initial {
-            Ok(sample) => match (sample.gradient, sample.hessian) {
-                (Some(g), Some(h)) => (sample.cost, g, h),
-                _ => {
-                    if self.bfgs_fallback {
-                        return self.run_bfgs_fallback(
-                            obj_fn,
-                            x_k.clone(),
-                            &history,
-                            0,
-                            func_evals,
-                            grad_evals,
-                        );
-                    }
-                    return Err(NewtonTrustRegionError::NonFiniteObjective);
-                }
-            },
+            Ok(sample) => sample,
             Err(ObjectiveEvalError::Recoverable { .. }) => {
                 if self.bfgs_fallback {
                     return self.run_bfgs_fallback(
@@ -949,6 +1431,7 @@ impl NewtonTrustRegionCore {
 
         let mut trust_radius = self.trust_radius.max(1e-8);
         let mut g_proj_k = self.projected_gradient(&x_k, &g_k);
+        let mut h_model_workspace = Array2::<f64>::zeros((n, n));
 
         for k in 0..self.max_iterations {
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
@@ -963,30 +1446,28 @@ impl NewtonTrustRegionCore {
                 });
             }
 
-            let h_model = symmetrize(&h_k);
+            let h_model = if hessian_is_effectively_symmetric(&h_k) {
+                &h_k
+            } else {
+                symmetrize_into(&mut h_model_workspace, &h_k);
+                &h_model_workspace
+            };
             let active = self.active_mask(&x_k, &g_k);
             let any_active = active.iter().copied().any(|v| v);
             let (trial_step, pred_dec_free) = if any_active {
-                let free_idx: Vec<usize> = (0..n).filter(|&i| !active[i]).collect();
-                if free_idx.is_empty() {
+                if !any_free_variables(&active) {
                     trust_radius = (trust_radius * 0.5).max(1e-12);
                     continue;
                 }
-                let (h_free, g_free) = self.extract_subspace(&h_model, &g_proj_k, &free_idx);
-                let (trial_step_free, pred_dec_free) =
-                    match self.steihaug_toint_step(&h_free, &g_free, trust_radius) {
-                        Some(v) => v,
-                        None => {
-                            trust_radius = (trust_radius * 0.5).max(1e-12);
-                            continue;
-                        }
-                    };
-                (
-                    self.expand_step(n, &free_idx, &trial_step_free),
-                    pred_dec_free,
-                )
+                match self.steihaug_toint_step(h_model, &g_proj_k, trust_radius, Some(&active)) {
+                    Some(v) => v,
+                    None => {
+                        trust_radius = (trust_radius * 0.5).max(1e-12);
+                        continue;
+                    }
+                }
             } else {
-                match self.steihaug_toint_step(&h_model, &g_proj_k, trust_radius) {
+                match self.steihaug_toint_step(h_model, &g_proj_k, trust_radius, None) {
                     Some(v) => v,
                     None => {
                         trust_radius = (trust_radius * 0.5).max(1e-12);
@@ -1008,7 +1489,7 @@ impl NewtonTrustRegionCore {
                 .sqrt()
                 > 1e-8 * (1.0 + trial_step.dot(&trial_step).sqrt())
             {
-                Self::predicted_decrease(&h_model, &g_proj_k, &s_trial)
+                Self::predicted_decrease(h_model, &g_proj_k, &s_trial)
             } else {
                 pred_dec_free
             };
@@ -1017,8 +1498,13 @@ impl NewtonTrustRegionCore {
                 continue;
             }
 
-            let f_trial = match obj_fn(&x_trial, ObjectiveRequest::CostOnly) {
-                Ok(sample) => sample.cost,
+            let (f_trial, g_trial, h_trial) = match oracle.eval_cost_grad_hessian(
+                obj_fn,
+                &x_trial,
+                &mut func_evals,
+                &mut grad_evals,
+            ) {
+                Ok(sample) => sample,
                 Err(ObjectiveEvalError::Recoverable { .. }) => {
                     trust_radius = (trust_radius * 0.2).max(1e-12);
                     continue;
@@ -1027,7 +1513,6 @@ impl NewtonTrustRegionCore {
                     return Err(NewtonTrustRegionError::ObjectiveFailed { message });
                 }
             };
-            func_evals += 1;
             if !f_trial.is_finite() {
                 trust_radius = (trust_radius * 0.5).max(1e-12);
                 continue;
@@ -1041,45 +1526,6 @@ impl NewtonTrustRegionCore {
             }
 
             if rho > self.eta_accept {
-                let accepted = obj_fn(&x_trial, ObjectiveRequest::GradientAndHessian);
-                func_evals += 1;
-                grad_evals += 1;
-                let (accepted_cost, g_trial, h_trial) = match accepted {
-                    Ok(sample) => match (sample.gradient, sample.hessian) {
-                        (Some(g), Some(h)) => (sample.cost, g, h),
-                        _ => {
-                            if self.bfgs_fallback {
-                                return self.run_bfgs_fallback(
-                                    obj_fn,
-                                    x_k.clone(),
-                                    &history,
-                                    k,
-                                    func_evals,
-                                    grad_evals,
-                                );
-                            }
-                            trust_radius = (trust_radius * 0.2).max(1e-12);
-                            continue;
-                        }
-                    },
-                    Err(ObjectiveEvalError::Recoverable { .. }) => {
-                        if self.bfgs_fallback {
-                            return self.run_bfgs_fallback(
-                                obj_fn,
-                                x_k.clone(),
-                                &history,
-                                k,
-                                func_evals,
-                                grad_evals,
-                            );
-                        }
-                        trust_radius = (trust_radius * 0.2).max(1e-12);
-                        continue;
-                    }
-                    Err(ObjectiveEvalError::Fatal { message }) => {
-                        return Err(NewtonTrustRegionError::ObjectiveFailed { message });
-                    }
-                };
                 if h_trial.nrows() != n || h_trial.ncols() != n {
                     return Err(NewtonTrustRegionError::HessianShapeMismatch {
                         expected: n,
@@ -1087,15 +1533,14 @@ impl NewtonTrustRegionCore {
                         got_cols: h_trial.ncols(),
                     });
                 }
-                if !accepted_cost.is_finite()
-                    || g_trial.iter().any(|v| !v.is_finite())
+                if g_trial.iter().any(|v| !v.is_finite())
                     || h_trial.iter().any(|v| !v.is_finite())
                 {
                     trust_radius = (trust_radius * 0.5).max(1e-12);
                     continue;
                 }
                 x_k = x_trial;
-                f_k = accepted_cost;
+                f_k = f_trial;
                 let y_k = &g_trial - &g_k;
                 if s_trial.dot(&s_trial).sqrt() > 1e-14 && y_k.dot(&y_k).sqrt() > 1e-14 {
                     if history.len() == self.history_cap.max(2) {
@@ -1130,7 +1575,6 @@ impl ArcCore {
             tolerance: 1e-5,
             max_iterations: 100,
             bounds: None,
-            config_error: None,
             theta: 1.0,
             sigma: 1.0,
             sigma_min: 1e-10,
@@ -1174,38 +1618,13 @@ impl ArcCore {
         }
     }
 
-    fn extract_subspace(
-        &self,
-        h: &Array2<f64>,
-        g: &Array1<f64>,
-        free_idx: &[usize],
-    ) -> (Array2<f64>, Array1<f64>) {
-        let m = free_idx.len();
-        let mut h_sub = Array2::<f64>::zeros((m, m));
-        let mut g_sub = Array1::<f64>::zeros(m);
-        for (ii, &i) in free_idx.iter().enumerate() {
-            g_sub[ii] = g[i];
-            for (jj, &j) in free_idx.iter().enumerate() {
-                h_sub[[ii, jj]] = h[[i, j]];
-            }
-        }
-        (h_sub, g_sub)
-    }
-
-    fn expand_step(&self, n: usize, free_idx: &[usize], step_sub: &Array1<f64>) -> Array1<f64> {
-        let mut step = Array1::<f64>::zeros(n);
-        for (ii, &i) in free_idx.iter().enumerate() {
-            step[i] = step_sub[ii];
-        }
-        step
-    }
-
     fn warm_inverse_from_history(
         &self,
         n: usize,
         history: &VecDeque<(Array1<f64>, Array1<f64>)>,
     ) -> Array2<f64> {
         let mut h_inv = Array2::<f64>::eye(n);
+        let mut backup = Array2::<f64>::zeros((n, n));
         if let Some((s_last, y_last)) = history.back() {
             let sy = s_last.dot(y_last);
             let yy = y_last.dot(y_last);
@@ -1219,32 +1638,8 @@ impl ArcCore {
             if !sty.is_finite() || sty <= 1e-12 {
                 continue;
             }
-            let rho = 1.0 / sty;
-            let hy = h_inv.dot(y);
-            let yhy = y.dot(&hy);
-            let coeff = (1.0 + yhy * rho) * rho;
-            let old = h_inv.clone();
-            for i in 0..n {
-                for j in 0..n {
-                    h_inv[[i, j]] += coeff * s[i] * s[j] - rho * (hy[i] * s[j] + s[i] * hy[j]);
-                }
-            }
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    let v = 0.5 * (h_inv[[i, j]] + h_inv[[j, i]]);
-                    h_inv[[i, j]] = v;
-                    h_inv[[j, i]] = v;
-                }
-            }
-            let mut bad = false;
-            for i in 0..n {
-                if !h_inv[[i, i]].is_finite() || h_inv[[i, i]] <= 0.0 {
-                    bad = true;
-                    break;
-                }
-            }
-            if bad {
-                h_inv = old;
+            if !apply_inverse_bfgs_update_in_place(&mut h_inv, s, y, &mut backup) {
+                h_inv.assign(&backup);
             }
         }
         h_inv
@@ -1260,55 +1655,38 @@ impl ArcCore {
         mut grad_evals: usize,
     ) -> Result<BfgsSolution, ArcError>
     where
-        ObjFn: FnMut(&Array1<f64>, ObjectiveRequest) -> Result<ObjectiveSample, ObjectiveEvalError>,
+        ObjFn: SecondOrderObjective,
     {
+        eprintln!(
+            "[OPT-TRACE] ARC -> BFGS fallback (iter_used={}, dim={})",
+            iter_used,
+            x_start.len()
+        );
         let n = x_start.len();
         let h0_inv = self.warm_inverse_from_history(n, history);
-        let lower_upper = self
-            .bounds
-            .as_ref()
-            .map(|b| (b.lower.clone(), b.upper.clone(), b.tol));
+        let bounds = self.bounds.as_ref().map(|b| Bounds { spec: b.clone() });
 
-        let mut fatal_error: Option<String> = None;
-        let mut bfgs = Bfgs::new(x_start, |x| {
-            match obj_fn(x, ObjectiveRequest::CostAndGradient) {
-                Ok(sample) => match sample.gradient {
-                    Some(g) if sample.cost.is_finite() && g.iter().all(|v| v.is_finite()) => {
-                        (sample.cost, g)
-                    }
-                    _ => (f64::INFINITY, Array1::<f64>::from_elem(x.len(), f64::NAN)),
-                },
-                Err(ObjectiveEvalError::Recoverable { .. }) => {
-                    (f64::INFINITY, Array1::<f64>::from_elem(x.len(), f64::NAN))
-                }
-                Err(ObjectiveEvalError::Fatal { message }) => {
-                    fatal_error = Some(message);
-                    (f64::INFINITY, Array1::<f64>::from_elem(x.len(), f64::NAN))
-                }
-            }
-        })
-        .with_tolerance(self.tolerance)
-        .with_max_iterations(self.max_iterations.saturating_sub(iter_used).max(1))
+        let mut bfgs = Bfgs::new(x_start, BorrowedFirstOrder::new(obj_fn))
+        .with_tolerance(Tolerance::new(self.tolerance).expect("core tolerance must be valid"))
+        .with_max_iterations(
+            MaxIterations::new(self.max_iterations.saturating_sub(iter_used).max(1))
+                .expect("core max_iterations must be valid"),
+        )
         .with_initial_inverse_hessian(h0_inv);
 
-        if let Some((lower, upper, tol)) = lower_upper {
-            bfgs = bfgs.with_bounds(lower, upper, tol);
+        if let Some(bounds) = bounds {
+            bfgs = bfgs.with_bounds(bounds);
         }
 
         let fallback_sol = match bfgs.run() {
             Ok(sol) => sol,
             Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
             Err(BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
-            Err(_) => {
-                if let Some(message) = fatal_error {
-                    return Err(ArcError::ObjectiveFailed { message });
-                }
-                return Err(ArcError::SubproblemFailed);
+            Err(BfgsError::ObjectiveFailed { message }) => {
+                return Err(ArcError::ObjectiveFailed { message });
             }
+            Err(_) => return Err(ArcError::SubproblemFailed),
         };
-        if let Some(message) = fatal_error {
-            return Err(ArcError::ObjectiveFailed { message });
-        }
         func_evals += fallback_sol.func_evals;
         grad_evals += fallback_sol.grad_evals;
         Ok(BfgsSolution {
@@ -1327,27 +1705,50 @@ impl ArcCore {
         h: &Array2<f64>,
         sigma: f64,
         s: &Array1<f64>,
+        active: Option<&[bool]>,
     ) -> (f64, f64, Array1<f64>) {
         // Cubic model:
         // m(s) = g^T s + (1/2) s^T H s + (sigma/3) ||s||^3
         // and gradient:
         // ∇m(s) = g + Hs + sigma ||s|| s.
-        let hs = h.dot(s);
+        let mut hs = Array1::<f64>::zeros(s.len());
+        if let Some(active) = active {
+            masked_hv_inplace(h, s, active, &mut hs);
+        } else {
+            hs.assign(&h.dot(s));
+        }
         let s_norm = s.dot(s).sqrt();
         let cubic = (sigma / 3.0) * s_norm.powi(3);
         let model_delta = g.dot(s) + 0.5 * s.dot(&hs) + cubic;
-        let grad_m = g + &hs + &(s * (sigma * s_norm));
+        let mut grad_m = g + &hs + &(s * (sigma * s_norm));
+        if let Some(active) = active {
+            mask_vector_inplace(&mut grad_m, active);
+        }
         (model_delta, s_norm, grad_m)
     }
 
-    fn cauchy_arc_step(&self, g: &Array1<f64>, h: &Array2<f64>, sigma: f64) -> Option<Array1<f64>> {
+    fn cauchy_arc_step(
+        &self,
+        g: &Array1<f64>,
+        h: &Array2<f64>,
+        sigma: f64,
+        active: Option<&[bool]>,
+    ) -> Option<Array1<f64>> {
         let g_norm = g.dot(g).sqrt();
         if !g_norm.is_finite() || g_norm <= 0.0 {
             return Some(Array1::<f64>::zeros(g.len()));
         }
-        let d = -g.clone();
+        let mut d = -g.clone();
+        if let Some(active) = active {
+            mask_vector_inplace(&mut d, active);
+        }
         let g2 = g.dot(g);
-        let hd = h.dot(&d);
+        let mut hd = Array1::<f64>::zeros(d.len());
+        if let Some(active) = active {
+            masked_hv_inplace(h, &d, active, &mut hd);
+        } else {
+            hd.assign(&h.dot(&d));
+        }
         let d_hd = d.dot(&hd);
         let c = sigma * g_norm.powi(3);
         let mut alpha = if c > 1e-16 {
@@ -1363,13 +1764,13 @@ impl ArcCore {
             alpha = 1.0 / g_norm.max(1.0);
         }
         let mut s = d * alpha;
-        let mut m = self.arc_model_value(g, h, sigma, &s).0;
+        let mut m = self.arc_model_value(g, h, sigma, &s, active).0;
         for _ in 0..8 {
             if m <= 0.0 {
                 return Some(s);
             }
             s *= 0.5;
-            m = self.arc_model_value(g, h, sigma, &s).0;
+            m = self.arc_model_value(g, h, sigma, &s, active).0;
         }
         if m <= 0.0 { Some(s) } else { None }
     }
@@ -1393,6 +1794,7 @@ impl ArcCore {
         h: &Array2<f64>,
         g: &Array1<f64>,
         sigma: f64,
+        active: Option<&[bool]>,
     ) -> Option<Array1<f64>> {
         let g_norm = g.dot(g).sqrt();
         if !g_norm.is_finite() {
@@ -1405,25 +1807,83 @@ impl ArcCore {
         let rhs = -g.clone();
         let n = g.len();
         let cg_base_iter = (n / 2).clamp(25, 120);
+        let active_opt = active;
+        let active = active.unwrap_or(&[]);
+        let use_mask = !active.is_empty();
+        if use_mask && !any_free_variables(active) {
+            return Some(Array1::<f64>::zeros(g.len()));
+        }
         // Solve (H + lambda I)s = -g while steering lambda toward sigma*||s||.
         // This tracks the cubic first-order stationarity condition.
         let mut lambda = (sigma * g_norm.sqrt()).max(1e-8);
         let mut best: Option<(f64, Array1<f64>)> = None;
+        let mut hs = Array1::<f64>::zeros(n);
 
         for _ in 0..self.subproblem_max_iterations {
-            let s = match cg_solve_adaptive(h, &rhs, cg_base_iter, 1e-10, lambda) {
-                Some(v) => v,
-                None => {
-                    lambda = (2.0 * lambda).max(1e-8);
-                    continue;
+            let mut s = if use_mask {
+                let mut s = Array1::<f64>::zeros(n);
+                let mut r = rhs.clone();
+                mask_vector_inplace(&mut r, active);
+                let mut p = r.clone();
+                let mut rtr = r.dot(&r);
+                if !rtr.is_finite() {
+                    return None;
+                }
+                for _ in 0..cg_base_iter {
+                    masked_hv_inplace(h, &p, active, &mut hs);
+                    hs.scaled_add(lambda, &p);
+                    let denom = p.dot(&hs);
+                    if !denom.is_finite() || denom <= 1e-14 * p.dot(&p).max(1.0) {
+                        s.fill(f64::NAN);
+                        break;
+                    }
+                    let alpha = rtr / denom;
+                    if !alpha.is_finite() || alpha <= 0.0 {
+                        s.fill(f64::NAN);
+                        break;
+                    }
+                    s.scaled_add(alpha, &p);
+                    r.scaled_add(-alpha, &hs);
+                    mask_vector_inplace(&mut s, active);
+                    mask_vector_inplace(&mut r, active);
+                    let rtr_next = r.dot(&r);
+                    if !rtr_next.is_finite() {
+                        s.fill(f64::NAN);
+                        break;
+                    }
+                    if rtr_next.sqrt() <= 1e-10 * g_norm.max(1.0) {
+                        break;
+                    }
+                    let beta = rtr_next / rtr.max(1e-32);
+                    if !beta.is_finite() || beta < 0.0 {
+                        s.fill(f64::NAN);
+                        break;
+                    }
+                    p *= beta;
+                    p += &r;
+                    mask_vector_inplace(&mut p, active);
+                    rtr = rtr_next;
+                }
+                s
+            } else {
+                match cg_solve_adaptive(h, &rhs, cg_base_iter, 1e-10, lambda) {
+                    Some(v) => v,
+                    None => {
+                        lambda = (2.0 * lambda).max(1e-8);
+                        continue;
+                    }
                 }
             };
+            if use_mask {
+                mask_vector_inplace(&mut s, active);
+            }
             if s.iter().any(|v| !v.is_finite()) {
                 lambda = (2.0 * lambda).max(1e-8);
                 continue;
             }
 
-            let (m_delta, s_norm, grad_m) = self.arc_model_value(g, h, sigma, &s);
+            let (m_delta, s_norm, grad_m) =
+                self.arc_model_value(g, h, sigma, &s, if use_mask { Some(active) } else { None });
             if !m_delta.is_finite() || !s_norm.is_finite() {
                 lambda = (2.0 * lambda).max(1e-8);
                 continue;
@@ -1462,47 +1922,37 @@ impl ArcCore {
         }
 
         if let Some((_, s)) = best {
-            let (m_delta, s_norm, grad_m) = self.arc_model_value(g, h, sigma, &s);
+            let (m_delta, s_norm, grad_m) =
+                self.arc_model_value(g, h, sigma, &s, if use_mask { Some(active) } else { None });
             let grad_norm = grad_m.dot(&grad_m).sqrt();
             let target = self.theta * s_norm * s_norm;
             if m_delta <= 0.0 && grad_norm <= target.max(1e-14) {
                 return Some(s);
             }
         }
-        self.cauchy_arc_step(g, h, sigma)
+        self.cauchy_arc_step(
+            g,
+            h,
+            sigma,
+            if use_mask { Some(active) } else { active_opt },
+        )
     }
 
     fn run<ObjFn>(&mut self, obj_fn: &mut ObjFn) -> Result<BfgsSolution, ArcError>
     where
-        ObjFn: FnMut(&Array1<f64>, ObjectiveRequest) -> Result<ObjectiveSample, ObjectiveEvalError>,
+        ObjFn: SecondOrderObjective,
     {
-        if let Some(message) = self.config_error.clone() {
-            return Err(ArcError::InvalidBounds { message });
-        }
         let n = self.x0.len();
         let mut x_k = self.project_point(&self.x0);
-        let initial = obj_fn(&x_k, ObjectiveRequest::CostGradientHessian);
-        let mut func_evals = 1usize;
-        let mut grad_evals = 1usize;
+        let mut func_evals = 0usize;
+        let mut grad_evals = 0usize;
+        let mut oracle = SecondOrderCache::new();
+        let initial =
+            oracle.eval_cost_grad_hessian(obj_fn, &x_k, &mut func_evals, &mut grad_evals);
         let mut history: VecDeque<(Array1<f64>, Array1<f64>)> =
             VecDeque::with_capacity(self.history_cap.max(2));
         let (mut f_k, mut g_k, mut h_k) = match initial {
-            Ok(sample) => match (sample.gradient, sample.hessian) {
-                (Some(g), Some(h)) => (sample.cost, g, h),
-                _ => {
-                    if self.bfgs_fallback {
-                        return self.run_bfgs_fallback(
-                            obj_fn,
-                            x_k.clone(),
-                            &history,
-                            0,
-                            func_evals,
-                            grad_evals,
-                        );
-                    }
-                    return Err(ArcError::NonFiniteObjective);
-                }
-            },
+            Ok(sample) => sample,
             Err(ObjectiveEvalError::Recoverable { .. }) => {
                 if self.bfgs_fallback {
                     return self.run_bfgs_fallback(
@@ -1534,6 +1984,7 @@ impl ArcCore {
             return Err(ArcError::NonFiniteObjective);
         }
         let mut model_failure_streak = 0usize;
+        let mut h_model_workspace = Array2::<f64>::zeros((n, n));
 
         for k in 0..self.max_iterations {
             let g_proj_k = self.projected_gradient(&x_k, &g_k);
@@ -1549,21 +2000,24 @@ impl ArcCore {
                 });
             }
 
-            let h_model = symmetrize(&h_k);
+            let h_model = if hessian_is_effectively_symmetric(&h_k) {
+                &h_k
+            } else {
+                symmetrize_into(&mut h_model_workspace, &h_k);
+                &h_model_workspace
+            };
             let active = self.active_mask(&x_k, &g_k);
             let any_active = active.iter().copied().any(|v| v);
-            // Solve the cubic model either on the full space or on the free
-            // subspace when simple box constraints are active.
+            // Solve the cubic model in the full space while masking bound-active
+            // coordinates instead of materializing reduced subspaces.
             let step = if any_active {
-                let free_idx: Vec<usize> = (0..n).filter(|&i| !active[i]).collect();
-                if free_idx.is_empty() {
+                if !any_free_variables(&active) {
                     // All coordinates are active at their bounds: increase sigma and retry.
                     self.escalate_sigma_on_failure(&mut model_failure_streak);
                     continue;
                 }
-                let (h_free, g_free) = self.extract_subspace(&h_model, &g_proj_k, &free_idx);
-                match self.solve_arc_subproblem(&h_free, &g_free, self.sigma) {
-                    Some(s_sub) => self.expand_step(n, &free_idx, &s_sub),
+                match self.solve_arc_subproblem(h_model, &g_proj_k, self.sigma, Some(&active)) {
+                    Some(s) => s,
                     None => {
                         // Failed subproblem solve: moderate growth first, stronger only
                         // after repeated failures.
@@ -1572,7 +2026,7 @@ impl ArcCore {
                     }
                 }
             } else {
-                match self.solve_arc_subproblem(&h_model, &g_proj_k, self.sigma) {
+                match self.solve_arc_subproblem(h_model, &g_proj_k, self.sigma, None) {
                     Some(s) => s,
                     None => {
                         // Failed subproblem solve: moderate growth first, stronger only
@@ -1594,92 +2048,22 @@ impl ArcCore {
             let step_distortion = (&s_trial - &step).dot(&(&s_trial - &step)).sqrt();
             let step_norm_ref = step.dot(&step).sqrt();
             let proj_changed = step_distortion > 1e-8 * (1.0 + step_norm_ref);
-            let (m_delta_trial, _, grad_m_trial) =
-                self.arc_model_value(&g_proj_k, &h_model, self.sigma, &s_trial);
-
-            // Enforce ARC first-order subproblem progress on the actual trial step
-            // (after possible box projection):
-            // m(s) <= m(0) and ||∇m(s)|| <= theta ||s||^2.
-            // For materially projected steps, the smooth unconstrained model no longer
-            // matches the realized step geometry; skip this strict check in that case.
-            if !proj_changed {
-                let grad_m_norm = grad_m_trial.dot(&grad_m_trial).sqrt();
-                let target_m = self.theta * s_norm * s_norm;
-                if !m_delta_trial.is_finite()
-                    || !grad_m_norm.is_finite()
-                    || m_delta_trial > 0.0
-                    || grad_m_norm > target_m.max(1e-14)
-                {
-                    self.escalate_sigma_on_failure(&mut model_failure_streak);
-                    continue;
-                }
-            }
-
-            // ARC regularized ratio denominator:
-            // m(0) - m(s) + (sigma/3)||s||^3
-            // = -(g^T s + 1/2 s^T H s)
-            // = -m(s) + (sigma/3)||s||^3.
-            // Reuse m(s) from the subproblem progress check to avoid an extra Hs.
-            let cubic_term = (self.sigma / 3.0) * s_norm.powi(3);
-            let denom = -m_delta_trial + cubic_term;
-            if !denom.is_finite() || denom <= 0.0 {
-                self.escalate_sigma_on_failure(&mut model_failure_streak);
-                continue;
-            }
-
-            let f_trial = match obj_fn(&x_trial, ObjectiveRequest::CostOnly) {
-                Ok(sample) => sample.cost,
-                Err(ObjectiveEvalError::Recoverable { .. }) => {
-                    self.escalate_sigma_on_failure(&mut model_failure_streak);
-                    continue;
-                }
-                Err(ObjectiveEvalError::Fatal { message }) => {
-                    return Err(ArcError::ObjectiveFailed { message });
-                }
-            };
-            func_evals += 1;
-            if !f_trial.is_finite() {
-                self.escalate_sigma_on_failure(&mut model_failure_streak);
-                continue;
-            }
-
-            let rho = (f_k - f_trial) / denom;
-            model_failure_streak = 0;
-            // ARC accept/reject decision:
-            // accept trial point iff rho >= eta1.
-            if rho >= self.eta1 {
-                let accepted = obj_fn(&x_trial, ObjectiveRequest::GradientAndHessian);
-                func_evals += 1;
-                grad_evals += 1;
-                let (accepted_cost, g_trial, h_trial) = match accepted {
-                    Ok(sample) => match (sample.gradient, sample.hessian) {
-                        (Some(g), Some(h)) => (sample.cost, g, h),
-                        _ => {
-                            if self.bfgs_fallback {
-                                return self.run_bfgs_fallback(
-                                    obj_fn,
-                                    x_k.clone(),
-                                    &history,
-                                    k,
-                                    func_evals,
-                                    grad_evals,
-                                );
-                            }
-                            return Err(ArcError::NonFiniteObjective);
-                        }
-                    },
+            if proj_changed {
+                // The unconstrained cubic model was solved for `step`, not the clipped
+                // projected step `s_trial`. Do not use ARC's rho/sigma update on the
+                // distorted step. Instead, refresh a coherent sample at the projected
+                // point and accept it only as a bound-activation progress step.
+                let projected = oracle.eval_cost_grad_hessian(
+                    obj_fn,
+                    &x_trial,
+                    &mut func_evals,
+                    &mut grad_evals,
+                );
+                let (f_trial, g_trial, h_trial) = match projected {
+                    Ok(sample) => sample,
                     Err(ObjectiveEvalError::Recoverable { .. }) => {
-                        if self.bfgs_fallback {
-                            return self.run_bfgs_fallback(
-                                obj_fn,
-                                x_k.clone(),
-                                &history,
-                                k,
-                                func_evals,
-                                grad_evals,
-                            );
-                        }
-                        return Err(ArcError::NonFiniteObjective);
+                        self.escalate_sigma_on_failure(&mut model_failure_streak);
+                        continue;
                     }
                     Err(ObjectiveEvalError::Fatal { message }) => {
                         return Err(ArcError::ObjectiveFailed { message });
@@ -1692,9 +2076,95 @@ impl ArcCore {
                         got_cols: h_trial.ncols(),
                     });
                 }
-                if !accepted_cost.is_finite()
+                if !f_trial.is_finite()
                     || g_trial.iter().any(|v| !v.is_finite())
                     || h_trial.iter().any(|v| !v.is_finite())
+                {
+                    return Err(ArcError::NonFiniteObjective);
+                }
+                let g_proj_trial = self.projected_gradient(&x_trial, &g_trial);
+                let g_proj_trial_norm = g_proj_trial.dot(&g_proj_trial).sqrt();
+                if f_trial <= f_k && (g_proj_trial_norm <= g_norm || g_proj_trial_norm <= self.tolerance)
+                {
+                    let y_k = &g_trial - &g_k;
+                    if s_norm > 1e-14 && y_k.dot(&y_k).sqrt() > 1e-14 {
+                        if history.len() == self.history_cap.max(2) {
+                            history.pop_front();
+                        }
+                        history.push_back((s_trial.clone(), y_k));
+                    }
+                    x_k = x_trial;
+                    f_k = f_trial;
+                    g_k = g_trial;
+                    h_k = h_trial;
+                    model_failure_streak = 0;
+                    // Bias the next cubic solve toward smaller feasible steps after
+                    // a bound-clipped move.
+                    self.sigma = (self.sigma * self.gamma2).min(self.sigma_max);
+                } else {
+                    self.escalate_sigma_on_failure(&mut model_failure_streak);
+                }
+                continue;
+            }
+            let (m_delta_trial, _, grad_m_trial) =
+                self.arc_model_value(&g_proj_k, h_model, self.sigma, &s_trial, Some(&active));
+
+            // Enforce ARC first-order subproblem progress on the actual trial step
+            // (after possible box projection):
+            // m(s) <= m(0) and ||∇m(s)|| <= theta ||s||^2.
+            let grad_m_norm = grad_m_trial.dot(&grad_m_trial).sqrt();
+            let target_m = self.theta * s_norm * s_norm;
+            if !m_delta_trial.is_finite()
+                || !grad_m_norm.is_finite()
+                || m_delta_trial > 0.0
+                || grad_m_norm > target_m.max(1e-14)
+            {
+                self.escalate_sigma_on_failure(&mut model_failure_streak);
+                continue;
+            }
+
+            // Standard ARC predicted reduction is m(0) - m(s) = -m(s),
+            // where `m_delta_trial` already includes the cubic term.
+            let denom = -m_delta_trial;
+            if !denom.is_finite() || denom <= 0.0 {
+                self.escalate_sigma_on_failure(&mut model_failure_streak);
+                continue;
+            }
+
+            let (f_trial, g_trial, h_trial) = match oracle.eval_cost_grad_hessian(
+                obj_fn,
+                &x_trial,
+                &mut func_evals,
+                &mut grad_evals,
+            ) {
+                Ok(sample) => sample,
+                Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    self.escalate_sigma_on_failure(&mut model_failure_streak);
+                    continue;
+                }
+                Err(ObjectiveEvalError::Fatal { message }) => {
+                    return Err(ArcError::ObjectiveFailed { message });
+                }
+            };
+
+            if !f_trial.is_finite() {
+                self.escalate_sigma_on_failure(&mut model_failure_streak);
+                continue;
+            }
+
+            let rho = (f_k - f_trial) / denom;
+            model_failure_streak = 0;
+            // ARC accept/reject decision:
+            // accept trial point iff rho >= eta1.
+            if rho >= self.eta1 {
+                if h_trial.nrows() != n || h_trial.ncols() != n {
+                    return Err(ArcError::HessianShapeMismatch {
+                        expected: n,
+                        got_rows: h_trial.nrows(),
+                        got_cols: h_trial.ncols(),
+                    });
+                }
+                if g_trial.iter().any(|v| !v.is_finite()) || h_trial.iter().any(|v| !v.is_finite())
                 {
                     return Err(ArcError::NonFiniteObjective);
                 }
@@ -1706,7 +2176,7 @@ impl ArcCore {
                     history.push_back((s_trial.clone(), y_k));
                 }
                 x_k = x_trial;
-                f_k = accepted_cost;
+                f_k = f_trial;
                 g_k = g_trial;
                 h_k = h_trial;
             }
@@ -1751,7 +2221,6 @@ struct BfgsCore {
     tau_f: f64,
     tau_g: f64,
     bounds: Option<BoxSpec>,
-    config_error: Option<String>,
     // If true, when the zoom bracket degenerates with flat f at both ends and
     // similar endpoint slopes, accept the midpoint once without additional
     // Armijo/curvature checks to break out of flat regions.
@@ -1799,6 +2268,8 @@ struct BfgsCore {
     chol_fail_iters: usize,
     spd_fail_seen: bool,
     initial_b_inv: Option<Array2<f64>>,
+    initial_grad_norm: f64,
+    local_mode: bool,
 }
 
 /// A configurable BFGS solver.
@@ -1839,6 +2310,7 @@ impl BfgsCore {
     fn try_trust_region_step<ObjFn>(
         &mut self,
         obj_fn: &mut ObjFn,
+        oracle: &mut FirstOrderCache,
         b_inv: &mut Array2<f64>,
         x_k: &Array1<f64>,
         f_k: f64,
@@ -1847,19 +2319,19 @@ impl BfgsCore {
         grad_evals: &mut usize,
     ) -> Option<(Array1<f64>, f64, Array1<f64>)>
     where
-        ObjFn: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
+        ObjFn: FirstOrderObjective,
     {
         self.tr_fallback_attempts = self.tr_fallback_attempts + 1;
         let n = b_inv.nrows();
+        let mut b_inv_backup = Array2::<f64>::zeros((n, n));
         let delta = self.trust_radius;
         let (p_tr, pred_dec_tr) = self.trust_region_dogleg(b_inv, g_k, delta)?;
         let raw_try = x_k + &p_tr;
         let x_try = self.project_point(&raw_try);
         let s_tr = &x_try - x_k;
         let g_old = g_k.clone();
-        let (f_try, g_try) = obj_fn(&x_try);
-        *func_evals += 1;
-        *grad_evals += 1;
+        let (f_try, g_try) =
+            bfgs_eval_cost_grad(oracle, obj_fn, &x_try, func_evals, grad_evals).ok()?;
         let act_dec = f_k - f_try;
         let p_diff = &s_tr - &p_tr;
         let p_diff_norm = p_diff.dot(&p_diff).sqrt();
@@ -1950,45 +2422,20 @@ impl BfgsCore {
                         b_inv[[i, i]] *= 1.0 + 1e-3;
                     }
                 } else {
-                    let rho = 1.0 / sty;
-                    let old_binv = b_inv.clone();
-                    let hy = old_binv.dot(&y_tilde);
-                    let y_h_y = y_tilde.dot(&hy);
-                    let coeff = (1.0 + y_h_y * rho) * rho;
-                    let mut updated = old_binv.clone();
-                    for i in 0..n {
-                        for j in 0..n {
-                            updated[[i, j]] += coeff * s_tr[i] * s_tr[j]
-                                - rho * (hy[i] * s_tr[j] + s_tr[i] * hy[j]);
-                        }
-                    }
-                    b_inv.assign(&updated);
-                    // Validate basic sanity without full factorization
-                    let mut diag_min = f64::INFINITY;
-                    for i in 0..n {
-                        diag_min = diag_min.min(b_inv[[i, i]]);
-                    }
-                    if !diag_min.is_finite() || diag_min <= 0.0 {
-                        b_inv.assign(&old_binv);
+                    if !apply_inverse_bfgs_update_in_place(
+                        b_inv,
+                        &s_tr,
+                        &y_tilde,
+                        &mut b_inv_backup,
+                    ) {
+                        b_inv.assign(&b_inv_backup);
                         for i in 0..n {
                             b_inv[[i, i]] += 1e-6;
                         }
                         update_status = "reverted";
                     }
                 }
-                // Regularize and enforce symmetry to counter drift.
-                for i in 0..n {
-                    for j in (i + 1)..n {
-                        let v = 0.5 * (b_inv[[i, j]] + b_inv[[j, i]]);
-                        b_inv[[i, j]] = v;
-                        b_inv[[j, i]] = v;
-                    }
-                }
-                let mut diag_min = f64::INFINITY;
-                for i in 0..n {
-                    diag_min = diag_min.min(b_inv[[i, i]]);
-                }
-                if !diag_min.is_finite() || diag_min <= 0.0 {
+                if !has_finite_positive_diagonal(b_inv) {
                     for i in 0..n {
                         b_inv[[i, i]] += 1e-12;
                     }
@@ -2030,7 +2477,6 @@ impl BfgsCore {
             tau_f: 1e3,
             tau_g: 1e2,
             bounds: None,
-            config_error: None,
             accept_flat_midpoint_once: true,
             jiggle_on_flats: true,
             jiggle_scale: 1e-3,
@@ -2066,15 +2512,57 @@ impl BfgsCore {
             chol_fail_iters: 0,
             spd_fail_seen: false,
             initial_b_inv: None,
+            initial_grad_norm: 0.0,
+            local_mode: false,
         }
     }
 
     #[inline]
     fn accept_nonmonotone(&self, f_k: f64, fmax: f64, gk_ts: f64, f_i: f64) -> bool {
+        if self.local_mode {
+            return false;
+        }
         let c1 = self.c1_adapt;
         let epsf_k = eps_f(f_k, self.tau_f);
         let epsf_max = eps_f(fmax, self.tau_f);
         (f_i <= f_k + c1 * gk_ts + epsf_k) || (f_i <= fmax + c1 * gk_ts + epsf_max)
+    }
+
+    #[inline]
+    fn relaxed_acceptors_enabled(&self) -> bool {
+        !self.local_mode
+    }
+
+    #[inline]
+    fn midpoint_acceptance_enabled(&self) -> bool {
+        self.accept_flat_midpoint_once && !self.local_mode
+    }
+
+    #[inline]
+    fn jiggle_enabled(&self) -> bool {
+        self.jiggle_on_flats && !self.local_mode
+    }
+
+    #[inline]
+    fn rescue_enabled(&self) -> bool {
+        self.multi_direction_rescue && !self.local_mode
+    }
+
+    #[inline]
+    fn refresh_local_mode(&mut self, g_norm: f64) {
+        let baseline = self.initial_grad_norm.max(self.tolerance).max(1e-16);
+        let gradient_small = g_norm <= 1e-2 * baseline;
+        let clean_successes = self.wolfe_clean_successes + self.bt_clean_successes;
+        self.local_mode = gradient_small || clean_successes >= 5;
+        if self.local_mode {
+            self.primary_strategy = LineSearchStrategy::StrongWolfe;
+            self.c1_adapt = self.c1;
+            self.c2_adapt = self.c2;
+            self.flat_accept_streak = 0;
+            self.curv_slack_scale = 1.0;
+            self.grad_drop_factor = 0.9;
+            self.gll.set_cap(1);
+        }
     }
 
     fn trust_region_dogleg(
@@ -2203,22 +2691,31 @@ impl BfgsCore {
 
     fn run<ObjFn>(&mut self, obj_fn: &mut ObjFn) -> Result<BfgsSolution, BfgsError>
     where
-        ObjFn: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
+        ObjFn: FirstOrderObjective,
     {
-        if let Some(msg) = self.config_error.clone() {
-            return Err(BfgsError::InvalidBounds { message: msg });
-        }
         let n = self.x0.len();
         let mut x_k = self.project_point(&self.x0);
-        let (mut f_k, mut g_k) = obj_fn(&x_k);
+        let mut oracle = FirstOrderCache::new();
+        let mut func_evals = 0;
+        let mut grad_evals = 0;
+        let mut b_inv_backup = Array2::<f64>::zeros((n, n));
+        let initial = oracle
+            .eval_cost_grad(obj_fn, &x_k, &mut func_evals, &mut grad_evals)
+            .map_err(|err| match err {
+                ObjectiveEvalError::Recoverable { message } | ObjectiveEvalError::Fatal { message } => {
+                    BfgsError::ObjectiveFailed { message }
+                }
+            })?;
+        let (mut f_k, mut g_k) = initial;
+        if !f_k.is_finite() || g_k.iter().any(|v| !v.is_finite()) {
+            return Err(BfgsError::GradientIsNaN);
+        }
         let mut g_proj_k = self.projected_gradient(&x_k, &g_k);
         let mut active_mask = if let Some(bounds) = &self.bounds {
             bounds.active_mask(&x_k, &g_k)
         } else {
             vec![false; n]
         };
-        let mut func_evals = 1;
-        let mut grad_evals = 1;
 
         if !matches!(self.primary_strategy, LineSearchStrategy::StrongWolfe)
             && self.wolfe_fail_streak != 0
@@ -2266,6 +2763,8 @@ impl BfgsCore {
         self.wolfe_fail_streak = 0;
         // Initialize trust radius from gradient scale
         let g0_norm = g_proj_k.dot(&g_proj_k).sqrt();
+        self.initial_grad_norm = g0_norm;
+        self.local_mode = false;
         let delta0 = if g0_norm.is_finite() && g0_norm > 0.0 {
             (10.0 / g0_norm).min(1.0)
         } else {
@@ -2289,6 +2788,7 @@ impl BfgsCore {
                 );
                 return Err(BfgsError::GradientIsNaN);
             }
+            self.refresh_local_mode(g_norm);
             if g_norm < self.tolerance {
                 let sol = BfgsSolution {
                     final_point: x_k,
@@ -2361,6 +2861,7 @@ impl BfgsCore {
                     LineSearchStrategy::StrongWolfe => line_search(
                         self,
                         obj_fn,
+                        &mut oracle,
                         &x_k,
                         &present_d_k,
                         f_k,
@@ -2369,7 +2870,15 @@ impl BfgsCore {
                         self.c2_adapt,
                     ),
                     LineSearchStrategy::Backtracking => {
-                        backtracking_line_search(self, obj_fn, &x_k, &present_d_k, f_k, &g_k)
+                        backtracking_line_search(
+                            self,
+                            obj_fn,
+                            &mut oracle,
+                            &x_k,
+                            &present_d_k,
+                            f_k,
+                            &g_k,
+                        )
                     }
                 };
 
@@ -2412,6 +2921,9 @@ impl BfgsCore {
                                     "[BFGS] Line search failed: max attempts reached ({attempts})."
                                 );
                             }
+                            LineSearchError::ObjectiveFailed(message) => {
+                                return Err(BfgsError::ObjectiveFailed { message });
+                            }
                         }
                         // Attempt fallback if the primary strategy was StrongWolfe.
                         if matches!(self.primary_strategy, LineSearchStrategy::StrongWolfe) {
@@ -2436,6 +2948,7 @@ impl BfgsCore {
                             let fallback_result = backtracking_line_search(
                                 self,
                                 obj_fn,
+                                &mut oracle,
                                 &x_k,
                                 &present_d_k,
                                 f_k,
@@ -2454,6 +2967,9 @@ impl BfgsCore {
                                         BACKTRACKING_MAX_ATTEMPTS,
                                         LineSearchFailureReason::StepSizeTooSmall,
                                     ),
+                                    Err(LineSearchError::ObjectiveFailed(message)) => {
+                                        return Err(BfgsError::ObjectiveFailed { message });
+                                    }
                                     Ok(_) => unreachable!(
                                         "entered fallback failure branch with Ok line-search result"
                                     ),
@@ -2500,6 +3016,7 @@ impl BfgsCore {
                                 // Try full trust-region dogleg fallback before giving up
                                 if let Some((x_new, f_new, g_new)) = self.try_trust_region_step(
                                     obj_fn,
+                                    &mut oracle,
                                     &mut b_inv,
                                     &x_k,
                                     f_k,
@@ -2595,6 +3112,7 @@ impl BfgsCore {
                             let fallback_result = backtracking_line_search(
                                 self,
                                 obj_fn,
+                                &mut oracle,
                                 &x_k,
                                 &present_d_k,
                                 f_k,
@@ -2611,6 +3129,9 @@ impl BfgsCore {
                                         BACKTRACKING_MAX_ATTEMPTS,
                                         LineSearchFailureReason::StepSizeTooSmall,
                                     ),
+                                    Err(LineSearchError::ObjectiveFailed(message)) => {
+                                        return Err(BfgsError::ObjectiveFailed { message });
+                                    }
                                     Ok(_) => unreachable!(
                                         "entered fallback failure branch with Ok line-search result"
                                     ),
@@ -2618,6 +3139,7 @@ impl BfgsCore {
                                 // Full trust-region dogleg fallback
                                 if let Some((x_new, f_new, g_new)) = self.try_trust_region_step(
                                     obj_fn,
+                                    &mut oracle,
                                     &mut b_inv,
                                     &x_k,
                                     f_k,
@@ -2745,7 +3267,7 @@ impl BfgsCore {
             // Optional coordinate rescue after consecutive flat accepts
             let mut s_override: Option<Array1<f64>> = None;
             let mut rescued = false;
-            if self.multi_direction_rescue {
+            if self.rescue_enabled() {
                 let epsF_iter = eps_f(f_k, self.tau_f);
                 let flat_now = (f_next - f_k).abs() <= epsF_iter;
                 if flat_now && self.flat_accept_streak >= 2 {
@@ -2801,9 +3323,19 @@ impl BfgsCore {
                                 let mut x_try = x_base.clone();
                                 x_try[i] += sgn * eta; // coordinate poke from x_next
                                 x_try = self.project_point(&x_try);
-                                let (f_try, g_try) = obj_fn(&x_try);
-                                func_evals += 1;
-                                grad_evals += 1;
+                                let (f_try, g_try) = match bfgs_eval_cost_grad(
+                                    &mut oracle,
+                                    obj_fn,
+                                    &x_try,
+                                    &mut func_evals,
+                                    &mut grad_evals,
+                                ) {
+                                    Ok(sample) => sample,
+                                    Err(ObjectiveEvalError::Recoverable { .. }) => continue,
+                                    Err(ObjectiveEvalError::Fatal { message }) => {
+                                        return Err(BfgsError::ObjectiveFailed { message });
+                                    }
+                                };
                                 if !f_try.is_finite() || g_try.iter().any(|v| !v.is_finite()) {
                                     continue;
                                 }
@@ -2835,9 +3367,21 @@ impl BfgsCore {
                                 let scale = delta / s_norm;
                                 let x_scaled = &x_k + &(s_tmp.mapv(|v| v * scale));
                                 let x_scaled = self.project_point(&x_scaled);
-                                let (f_s, g_s) = obj_fn(&x_scaled);
-                                func_evals += 1;
-                                grad_evals += 1;
+                                let (f_s, g_s) = match bfgs_eval_cost_grad(
+                                    &mut oracle,
+                                    obj_fn,
+                                    &x_scaled,
+                                    &mut func_evals,
+                                    &mut grad_evals,
+                                ) {
+                                    Ok(sample) => sample,
+                                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                                        (f64::NAN, Array1::zeros(x_scaled.len()))
+                                    }
+                                    Err(ObjectiveEvalError::Fatal { message }) => {
+                                        return Err(BfgsError::ObjectiveFailed { message });
+                                    }
+                                };
                                 if f_s.is_finite() && g_s.iter().all(|v| v.is_finite()) {
                                     s_tmp = &x_scaled - &x_k;
                                     f_next = f_s;
@@ -3015,27 +3559,13 @@ impl BfgsCore {
                                 b_inv[[i, i]] *= 1.0 + 1e-3;
                             }
                         } else {
-                            let rho = 1.0 / sty;
-                            let old_binv = b_inv.clone();
-                            let hy = old_binv.dot(&y_tilde);
-                            let y_h_y = y_tilde.dot(&hy);
-                            // Inverse-BFGS update expanded into symmetric rank-2 terms,
-                            // with coeff = rho + rho^2 * (y^T H y).
-                            let coeff = (1.0 + y_h_y * rho) * rho;
-                            let mut updated = old_binv.clone();
-                            for i in 0..n {
-                                for j in 0..n {
-                                    updated[[i, j]] += coeff * s_k[i] * s_k[j]
-                                        - rho * (hy[i] * s_k[j] + s_k[i] * hy[j]);
-                                }
-                            }
-                            b_inv.assign(&updated);
-                            let mut diag_min = f64::INFINITY;
-                            for i in 0..n {
-                                diag_min = diag_min.min(b_inv[[i, i]]);
-                            }
-                            if !diag_min.is_finite() || diag_min <= 0.0 {
-                                b_inv.assign(&old_binv);
+                            if !apply_inverse_bfgs_update_in_place(
+                                &mut b_inv,
+                                &s_k,
+                                &y_tilde,
+                                &mut b_inv_backup,
+                            ) {
+                                b_inv.assign(&b_inv_backup);
                                 for i in 0..n {
                                     b_inv[[i, i]] += 1e-6;
                                 }
@@ -3208,13 +3738,13 @@ impl BfgsCore {
 
 impl<ObjFn> Bfgs<ObjFn>
 where
-    ObjFn: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
+    ObjFn: FirstOrderObjective,
 {
     /// Creates a new BFGS solver.
     ///
     /// # Arguments
     /// * `x0` - The initial guess for the minimum.
-    /// * `obj_fn` - The objective function which returns a tuple `(value, gradient)`.
+    /// * `obj_fn` - First-order objective.
     pub fn new(x0: Array1<f64>, obj_fn: ObjFn) -> Self {
         Self {
             core: BfgsCore::new(x0),
@@ -3223,14 +3753,14 @@ where
     }
 
     /// Sets the convergence tolerance (default: 1e-5).
-    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
-        self.core.tolerance = tolerance;
+    pub fn with_tolerance(mut self, tolerance: Tolerance) -> Self {
+        self.core.tolerance = tolerance.get();
         self
     }
 
     /// Sets the maximum number of iterations (default: 100).
-    pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
-        self.core.max_iterations = max_iterations;
+    pub fn with_max_iterations(mut self, max_iterations: MaxIterations) -> Self {
+        self.core.max_iterations = max_iterations.get();
         self
     }
 
@@ -3243,20 +3773,8 @@ where
     /// Provides simple box bounds for each coordinate (lower <= x <= upper).
     /// Points are projected by coordinate clamping, and the gradient is projected
     /// by zeroing active constraints during direction updates.
-    pub fn with_bounds(mut self, lower: Array1<f64>, upper: Array1<f64>, tol: f64) -> Self {
-        if lower.len() != upper.len() {
-            self.core.config_error = Some("lower/upper lengths differ".to_string());
-            return self;
-        }
-        for i in 0..lower.len() {
-            if lower[i] > upper[i] {
-                self.core.config_error =
-                    Some(format!("lower bound exceeds upper bound at index {}", i));
-                return self;
-            }
-        }
-        self.core.config_error = None;
-        self.core.bounds = Some(BoxSpec::new(lower, upper, tol.max(0.0)));
+    pub fn with_bounds(mut self, bounds: Bounds) -> Self {
+        self.core.bounds = Some(bounds.spec);
         self
     }
 
@@ -3350,14 +3868,13 @@ where
 
 impl<ObjFn> NewtonTrustRegion<ObjFn>
 where
-    ObjFn: FnMut(&Array1<f64>, ObjectiveRequest) -> Result<ObjectiveSample, ObjectiveEvalError>,
+    ObjFn: SecondOrderObjective,
 {
     /// Creates a new Newton trust-region solver.
     ///
     /// # Arguments
     /// * `x0` - The initial guess for the minimum.
-    /// * `obj_fn` - Oracle-style objective callback; it receives a request enum and
-    ///   should return exactly the requested derivatives.
+    /// * `obj_fn` - Second-order objective.
     pub fn new(x0: Array1<f64>, obj_fn: ObjFn) -> Self {
         Self {
             core: NewtonTrustRegionCore::new(x0),
@@ -3366,56 +3883,38 @@ where
     }
 
     /// Sets the convergence tolerance on projected gradient norm (default: 1e-5).
-    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
-        self.core.tolerance = tolerance.max(1e-12);
+    pub fn with_tolerance(mut self, tolerance: Tolerance) -> Self {
+        self.core.tolerance = tolerance.get();
         self
     }
 
     /// Sets the maximum number of iterations (default: 100).
-    pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
-        self.core.max_iterations = max_iterations.max(1);
+    pub fn with_max_iterations(mut self, max_iterations: MaxIterations) -> Self {
+        self.core.max_iterations = max_iterations.get();
         self
     }
 
     /// Provides simple box bounds for each coordinate (lower <= x <= upper).
-    pub fn with_bounds(mut self, lower: Array1<f64>, upper: Array1<f64>, tol: f64) -> Self {
-        if lower.len() != upper.len() {
-            self.core.config_error = Some("lower/upper lengths differ".to_string());
-            return self;
-        }
-        for i in 0..lower.len() {
-            if lower[i] > upper[i] {
-                self.core.config_error =
-                    Some(format!("lower bound exceeds upper bound at index {}", i));
-                return self;
-            }
-        }
-        self.core.config_error = None;
-        self.core.bounds = Some(BoxSpec::new(lower, upper, tol.max(0.0)));
+    pub fn with_bounds(mut self, bounds: Bounds) -> Self {
+        self.core.bounds = Some(bounds.spec);
         self
     }
 
     /// Sets the initial trust-region radius.
-    pub fn with_initial_trust_radius(mut self, trust_radius: f64) -> Self {
-        if trust_radius.is_finite() && trust_radius > 0.0 {
-            self.core.trust_radius = trust_radius;
-        }
+    pub fn with_initial_trust_radius(mut self, trust_radius: TrustRegionRadius) -> Self {
+        self.core.trust_radius = trust_radius.get();
         self
     }
 
     /// Sets the maximum trust-region radius.
-    pub fn with_max_trust_radius(mut self, trust_radius_max: f64) -> Self {
-        if trust_radius_max.is_finite() && trust_radius_max > 0.0 {
-            self.core.trust_radius_max = trust_radius_max;
-        }
+    pub fn with_max_trust_radius(mut self, trust_radius_max: TrustRegionRadius) -> Self {
+        self.core.trust_radius_max = trust_radius_max.get();
         self
     }
 
     /// Sets the acceptance ratio threshold for trial steps (default: 0.1).
-    pub fn with_acceptance_threshold(mut self, eta_accept: f64) -> Self {
-        if eta_accept.is_finite() {
-            self.core.eta_accept = eta_accept.clamp(0.0, 0.9);
-        }
+    pub fn with_acceptance_threshold(mut self, eta_accept: NewtonAcceptance) -> Self {
+        self.core.eta_accept = eta_accept.get();
         self
     }
 
@@ -3440,14 +3939,13 @@ where
 
 impl<ObjFn> Arc<ObjFn>
 where
-    ObjFn: FnMut(&Array1<f64>, ObjectiveRequest) -> Result<ObjectiveSample, ObjectiveEvalError>,
+    ObjFn: SecondOrderObjective,
 {
     /// Creates a new ARC solver.
     ///
     /// # Arguments
     /// * `x0` - The initial guess for the minimum.
-    /// * `obj_fn` - Oracle-style objective callback; it receives a request enum and
-    ///   should return exactly the requested derivatives.
+    /// * `obj_fn` - Second-order objective.
     pub fn new(x0: Array1<f64>, obj_fn: ObjFn) -> Self {
         Self {
             core: ArcCore::new(x0),
@@ -3456,14 +3954,14 @@ where
     }
 
     /// Sets the convergence tolerance on projected gradient norm (default: 1e-5).
-    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
-        self.core.tolerance = tolerance.max(1e-12);
+    pub fn with_tolerance(mut self, tolerance: Tolerance) -> Self {
+        self.core.tolerance = tolerance.get();
         self
     }
 
     /// Sets the maximum number of iterations (default: 100).
-    pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
-        self.core.max_iterations = max_iterations.max(1);
+    pub fn with_max_iterations(mut self, max_iterations: MaxIterations) -> Self {
+        self.core.max_iterations = max_iterations.get();
         self
     }
 
@@ -3477,30 +3975,24 @@ where
     }
 
     /// Sets the initial cubic regularization parameter `sigma` (default: 1.0).
-    pub fn with_initial_sigma(mut self, sigma: f64) -> Self {
-        if sigma.is_finite() && sigma > 0.0 {
-            self.core.sigma = sigma;
-        }
+    pub fn with_initial_sigma(mut self, sigma: SigmaValue) -> Self {
+        self.core.sigma = sigma.get();
         self
     }
 
     /// Sets the minimum allowed regularization parameter `sigma_min` (default: 1e-8).
-    pub fn with_min_sigma(mut self, sigma_min: f64) -> Self {
-        if sigma_min.is_finite() && sigma_min > 0.0 {
-            self.core.sigma_min = sigma_min;
-            if self.core.sigma < self.core.sigma_min {
-                self.core.sigma = self.core.sigma_min;
-            }
+    pub fn with_min_sigma(mut self, sigma_min: SigmaValue) -> Self {
+        self.core.sigma_min = sigma_min.get();
+        if self.core.sigma < self.core.sigma_min {
+            self.core.sigma = self.core.sigma_min;
         }
         self
     }
 
     /// Sets an upper guard on regularization growth (default: 1e12).
-    pub fn with_max_sigma(mut self, sigma_max: f64) -> Self {
-        if sigma_max.is_finite() && sigma_max > 0.0 {
-            self.core.sigma_max = sigma_max.max(self.core.sigma_min);
-            self.core.sigma = self.core.sigma.min(self.core.sigma_max);
-        }
+    pub fn with_max_sigma(mut self, sigma_max: SigmaValue) -> Self {
+        self.core.sigma_max = sigma_max.get();
+        self.core.sigma = self.core.sigma.min(self.core.sigma_max);
         self
     }
 
@@ -3508,11 +4000,9 @@ where
     ///
     /// A trial step is accepted when `rho >= eta1`, and considered very successful
     /// when `rho >= eta2`.
-    pub fn with_acceptance_thresholds(mut self, eta1: f64, eta2: f64) -> Self {
-        if eta1.is_finite() && eta2.is_finite() && eta1 > 0.0 && eta1 <= eta2 && eta2 < 1.0 {
-            self.core.eta1 = eta1;
-            self.core.eta2 = eta2;
-        }
+    pub fn with_acceptance_thresholds(mut self, thresholds: ArcAcceptance) -> Self {
+        self.core.eta1 = thresholds.eta1;
+        self.core.eta2 = thresholds.eta2;
         self
     }
 
@@ -3523,37 +4013,16 @@ where
     /// - very successful (`rho >= eta2`): `sigma <- gamma1 * sigma`
     /// - successful (`eta1 <= rho < eta2`): `sigma` unchanged
     /// - unsuccessful (`rho < eta1`): `sigma` grows (`gamma2` / stronger path)
-    pub fn with_sigma_update_factors(mut self, gamma1: f64, gamma2: f64, gamma3: f64) -> Self {
-        if gamma1.is_finite()
-            && gamma2.is_finite()
-            && gamma3.is_finite()
-            && gamma1 > 0.0
-            && gamma1 < 1.0
-            && gamma2 > 1.0
-            && gamma2 <= gamma3
-        {
-            self.core.gamma1 = gamma1;
-            self.core.gamma2 = gamma2;
-            self.core.gamma3 = gamma3;
-        }
+    pub fn with_sigma_update_factors(mut self, update: SigmaUpdate) -> Self {
+        self.core.gamma1 = update.gamma1;
+        self.core.gamma2 = update.gamma2;
+        self.core.gamma3 = update.gamma3;
         self
     }
 
     /// Provides simple box bounds for each coordinate (lower <= x <= upper).
-    pub fn with_bounds(mut self, lower: Array1<f64>, upper: Array1<f64>, tol: f64) -> Self {
-        if lower.len() != upper.len() {
-            self.core.config_error = Some("lower/upper lengths differ".to_string());
-            return self;
-        }
-        for i in 0..lower.len() {
-            if lower[i] > upper[i] {
-                self.core.config_error =
-                    Some(format!("lower bound exceeds upper bound at index {}", i));
-                return self;
-            }
-        }
-        self.core.config_error = None;
-        self.core.bounds = Some(BoxSpec::new(lower, upper, tol.max(0.0)));
+    pub fn with_bounds(mut self, bounds: Bounds) -> Self {
+        self.core.bounds = Some(bounds.spec);
         self
     }
 
@@ -3595,6 +4064,7 @@ where
 fn line_search<ObjFn>(
     core: &mut BfgsCore,
     obj_fn: &mut ObjFn,
+    oracle: &mut FirstOrderCache,
     x_k: &Array1<f64>,
     d_k: &Array1<f64>,
     f_k: f64,
@@ -3603,7 +4073,7 @@ fn line_search<ObjFn>(
     c2: f64,
 ) -> LsResult
 where
-    ObjFn: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
+    ObjFn: FirstOrderObjective,
 {
     let mut alpha_i: f64 = 1.0; // Start with a unit step.
     let mut alpha_prev = 0.0;
@@ -3626,14 +4096,17 @@ where
     let mut best = ProbeBest::new(x_k, f_k, g_k);
     for _ in 0..max_attempts {
         let (x_new, s, kinked) = core.project_with_step(x_k, d_k, alpha_i);
-        let (f_i, g_i) = obj_fn(&x_new);
-        func_evals += 1;
-        grad_evals += 1;
-        best.consider(&x_new, f_i, &g_i);
+        let mut f_i = match bfgs_eval_cost(oracle, obj_fn, &x_new, &mut func_evals)
+        {
+            Ok(f) => f,
+            Err(ObjectiveEvalError::Recoverable { .. }) => f64::NAN,
+            Err(ObjectiveEvalError::Fatal { message }) => {
+                return Err(LineSearchError::ObjectiveFailed(message));
+            }
+        };
 
         // Handle any non-finite value early
-        let g_i_finite = g_i.iter().all(|v| v.is_finite());
-        if !f_i.is_finite() || !g_i_finite {
+        if !f_i.is_finite() {
             core.nonfinite_seen = true;
             if alpha_prev == 0.0 {
                 alpha_i *= 0.5;
@@ -3644,6 +4117,7 @@ where
                 if let Some((a, f, g, kind)) = probe_alphas(
                     core,
                     obj_fn,
+                    oracle,
                     x_k,
                     d_k,
                     f_k,
@@ -3667,11 +4141,6 @@ where
         }
 
         // Classic Armijo + previous worsening for bracketing (Strong-Wolfe)
-        let d_eff = if kinked && alpha_i > 0.0 {
-            s.mapv(|v| v / alpha_i)
-        } else {
-            d_k.clone()
-        };
         let gkTs = g_proj_k.dot(&s);
         let armijo_strict = f_i > f_k + c1 * gkTs + epsF;
         let prev_worse = func_evals > 1 && f_i >= f_prev - epsF;
@@ -3683,19 +4152,97 @@ where
                 false
             };
             if kink_lo || kinked {
-                let fallback = backtracking_line_search(core, obj_fn, x_k, d_k, f_k, g_k);
+                let fallback =
+                    backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
                 return fallback.map(|(a, f, g, fe, ge, kind)| {
                     (a, f, g, fe + func_evals, ge + grad_evals, kind)
                 });
             }
-            // The minimum is bracketed between alpha_prev and alpha_i.
-            // A non-finite gradient from a non-finite function value is handled
-            // robustly by the zoom function.
-            let g_proj_i = core.projected_gradient(&x_new, &g_i);
-            let g_i_dot_d = g_proj_i.dot(&d_eff);
             let r = zoom(
                 core,
                 obj_fn,
+                oracle,
+                x_k,
+                d_k,
+                f_k,
+                g_k,
+                &g_proj_k,
+                g_k_dot_d,
+                c1,
+                c2,
+                alpha_prev,
+                alpha_i,
+                f_prev,
+                f_i,
+                g_prev_dot_d,
+                f64::NAN,
+                func_evals,
+                grad_evals,
+            );
+            if r.is_err() {
+                if best.f.is_finite() {
+                    core.global_best = Some(best.clone());
+                }
+            }
+            return r;
+        }
+
+        let (f_full, g_i) =
+            match bfgs_eval_cost_grad(oracle, obj_fn, &x_new, &mut func_evals, &mut grad_evals) {
+                Ok(sample) => sample,
+                Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    core.nonfinite_seen = true;
+                    if alpha_prev == 0.0 {
+                        alpha_i *= 0.5;
+                    } else {
+                        alpha_i = 0.5 * (alpha_prev + alpha_i);
+                    }
+                    if alpha_i <= 1e-18 {
+                        return Err(LineSearchError::StepSizeTooSmall);
+                    }
+                    continue;
+                }
+                Err(ObjectiveEvalError::Fatal { message }) => {
+                    return Err(LineSearchError::ObjectiveFailed(message));
+                }
+            };
+        f_i = f_full;
+        if !f_i.is_finite() || g_i.iter().any(|v| !v.is_finite()) {
+            core.nonfinite_seen = true;
+            if alpha_prev == 0.0 {
+                alpha_i *= 0.5;
+            } else {
+                alpha_i = 0.5 * (alpha_prev + alpha_i);
+            }
+            if alpha_i <= 1e-18 {
+                return Err(LineSearchError::StepSizeTooSmall);
+            }
+            continue;
+        }
+        best.consider(&x_new, f_i, &g_i);
+
+        let armijo_strict = f_i > f_k + c1 * gkTs + epsF;
+        let prev_worse = func_evals > 1 && f_i >= f_prev - epsF;
+        if armijo_strict || prev_worse {
+            let kink_lo = if alpha_prev > 0.0 {
+                let (_, _, kink_prev) = core.project_with_step(x_k, d_k, alpha_prev);
+                kink_prev
+            } else {
+                false
+            };
+            if kink_lo || kinked {
+                let fallback =
+                    backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
+                return fallback.map(|(a, f, g, fe, ge, kind)| {
+                    (a, f, g, fe + func_evals, ge + grad_evals, kind)
+                });
+            }
+            let g_proj_i = core.projected_gradient(&x_new, &g_i);
+            let g_i_dot_d = directional_derivative(&g_proj_i, &s, alpha_i, d_k);
+            let r = zoom(
+                core,
+                obj_fn,
+                oracle,
                 x_k,
                 d_k,
                 f_k,
@@ -3713,18 +4260,16 @@ where
                 func_evals,
                 grad_evals,
             );
-            if r.is_err() {
-                if best.f.is_finite() {
-                    core.global_best = Some(best.clone());
-                }
+            if r.is_err() && best.f.is_finite() {
+                core.global_best = Some(best.clone());
             }
             return r;
         }
 
         let g_proj_i = core.projected_gradient(&x_new, &g_i);
-        let g_i_dot_d = g_proj_i.dot(&d_eff);
+        let g_i_dot_d = directional_derivative(&g_proj_i, &s, alpha_i, d_k);
         // The curvature condition.
-        let g_k_dot_eff = g_proj_k.dot(&d_eff);
+        let g_k_dot_eff = directional_derivative(&g_proj_k, &s, alpha_i, d_k);
         if g_i_dot_d.abs() <= c2 * g_k_dot_eff.abs() {
             // Strong Wolfe conditions are satisfied.
             // Expand trust radius modestly on successful strong-wolfe step
@@ -3743,9 +4288,13 @@ where
         // Approximate-Wolfe and gradient-reduction acceptors
         let approx_curv_ok = g_i_dot_d.abs()
             <= c2 * g_k_dot_eff.abs()
-                + core.curv_slack_scale * eps_g(&g_proj_k, &d_eff, core.tau_g);
+                + core.curv_slack_scale * eps_g(&g_proj_k, d_k, core.tau_g);
         let f_flat_ok = f_i <= f_k + epsF;
-        if approx_curv_ok && f_flat_ok && g_i_dot_d <= -eps_g(&g_proj_k, &d_eff, core.tau_g) {
+        if core.relaxed_acceptors_enabled()
+            && approx_curv_ok
+            && f_flat_ok
+            && g_i_dot_d <= -eps_g(&g_proj_k, d_k, core.tau_g)
+        {
             core.approx_wolfe_accepts += 1;
             return Ok((
                 alpha_i,
@@ -3759,9 +4308,10 @@ where
         let gi_norm = g_proj_i.dot(&g_proj_i).sqrt();
         let gk_norm = g_proj_k.dot(&g_proj_k).sqrt();
         let drop_factor = core.grad_drop_factor;
-        if f_flat_ok
+        if core.relaxed_acceptors_enabled()
+            && f_flat_ok
             && gi_norm <= drop_factor * gk_norm
-            && g_i_dot_d <= -eps_g(&g_proj_k, &d_eff, core.tau_g)
+            && g_i_dot_d <= -eps_g(&g_proj_k, d_k, core.tau_g)
         {
             return Ok((
                 alpha_i,
@@ -3791,12 +4341,13 @@ where
             ));
         }
 
-        if g_i_dot_d >= -eps_g(&g_proj_k, &d_eff, core.tau_g) {
+        if g_i_dot_d >= -eps_g(&g_proj_k, d_k, core.tau_g) {
             // The minimum is bracketed between alpha_i and alpha_prev.
             // The current point is the best (low) endpoint.
             let r = zoom(
                 core,
                 obj_fn,
+                oracle,
                 x_k,
                 d_k,
                 f_k,
@@ -3838,6 +4389,7 @@ where
         && let Some((a, f, g, kind)) = probe_alphas(
             core,
             obj_fn,
+            oracle,
             x_k,
             d_k,
             f_k,
@@ -3859,13 +4411,14 @@ where
 fn backtracking_line_search<ObjFn>(
     core: &mut BfgsCore,
     obj_fn: &mut ObjFn,
+    oracle: &mut FirstOrderCache,
     x_k: &Array1<f64>,
     d_k: &Array1<f64>,
     f_k: f64,
     g_k: &Array1<f64>,
 ) -> LsResult
 where
-    ObjFn: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
+    ObjFn: FirstOrderObjective,
 {
     let mut alpha: f64 = 1.0;
     let mut rho = 0.5;
@@ -3890,13 +4443,17 @@ where
     let dnorm = d_k.dot(d_k).sqrt();
     for _ in 0..max_attempts {
         let (x_new, s, _) = core.project_with_step(x_k, d_k, alpha);
-        let (f_new, g_new) = obj_fn(&x_new);
-        func_evals += 1;
-        grad_evals += 1;
-        best.consider(&x_new, f_new, &g_new);
+        let mut f_new =
+            match bfgs_eval_cost(oracle, obj_fn, &x_new, &mut func_evals) {
+                Ok(f) => f,
+                Err(ObjectiveEvalError::Recoverable { .. }) => f64::NAN,
+                Err(ObjectiveEvalError::Fatal { message }) => {
+                    return Err(LineSearchError::ObjectiveFailed(message));
+                }
+            };
 
         // If evaluation is non-finite, shrink alpha and continue (salvage best-so-far)
-        if !f_new.is_finite() || g_new.iter().any(|v| !v.is_finite()) {
+        if !f_new.is_finite() {
             core.nonfinite_seen = true;
             alpha *= rho;
             if alpha < 1e-16 {
@@ -3913,33 +4470,83 @@ where
         } else {
             core.gll.fmax()
         };
-        let g_proj_new = core.projected_gradient(&x_new, &g_new);
-        let d_eff = if alpha > 0.0 {
-            s.mapv(|v| v / alpha)
-        } else {
-            d_k.clone()
-        };
-        let gk_dot_eff = g_proj_k.dot(&d_eff);
         let gkTs = g_proj_k.dot(&s);
-        let armijo_accept = core.accept_nonmonotone(f_k, fmax, gkTs, f_new);
-        if f_new.is_finite() && armijo_accept {
-            return Ok((
-                alpha,
-                f_new,
-                g_new,
-                func_evals,
-                grad_evals,
-                AcceptKind::Nonmonotone,
-            ));
+        let mut armijo_accept = core.accept_nonmonotone(f_k, fmax, gkTs, f_new);
+        let candidate_for_gradient = armijo_accept || (core.relaxed_acceptors_enabled() && f_new <= f_k + epsF);
+        let mut g_new_opt = None;
+        if candidate_for_gradient {
+            let (f_full, g_new) =
+                match bfgs_eval_cost_grad(oracle, obj_fn, &x_new, &mut func_evals, &mut grad_evals)
+                {
+                    Ok(sample) => sample,
+                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                        core.nonfinite_seen = true;
+                        alpha *= rho;
+                        if alpha < 1e-16 {
+                            return Err(LineSearchError::StepSizeTooSmall);
+                        }
+                        continue;
+                    }
+                    Err(ObjectiveEvalError::Fatal { message }) => {
+                        return Err(LineSearchError::ObjectiveFailed(message));
+                    }
+                };
+            f_new = f_full;
+            if !f_new.is_finite() || g_new.iter().any(|v| !v.is_finite()) {
+                core.nonfinite_seen = true;
+                alpha *= rho;
+                if alpha < 1e-16 {
+                    return Err(LineSearchError::StepSizeTooSmall);
+                }
+                continue;
+            }
+            armijo_accept = core.accept_nonmonotone(f_k, fmax, gkTs, f_new);
+            best.consider(&x_new, f_new, &g_new);
+            g_new_opt = Some(g_new);
         }
 
+        if armijo_accept && let Some(g_new) = g_new_opt.take() {
+            return Ok((alpha, f_new, g_new, func_evals, grad_evals, AcceptKind::Nonmonotone));
+        }
+
+        let Some(g_new) = g_new_opt else {
+            if (f_new - f_k).abs() <= epsF {
+                no_change_count += 1;
+            } else {
+                no_change_count = 0;
+                expanded_once = false;
+            }
+            if no_change_count >= 3 {
+                rho = 0.8;
+            }
+            if no_change_count >= 2 && !expanded_once {
+                alpha /= rho;
+                expanded_once = true;
+            } else {
+                alpha *= rho;
+            }
+            if core.jiggle_enabled() && no_change_count >= 2 {
+                let jiggle = 1.0 + core.jiggle_scale * core.next_rand_sym();
+                alpha = (alpha * jiggle).max(f64::EPSILON);
+            }
+            let tol_x = 1e-12 * (1.0 + x_k.dot(x_k).sqrt()) + 1e-16;
+            if (alpha * dnorm) <= tol_x {
+                return Err(LineSearchError::StepSizeTooSmall);
+            }
+            continue;
+        };
+
         // Gradient reduction acceptance
+        let g_proj_new = core.projected_gradient(&x_new, &g_new);
+        let gk_dot_eff = directional_derivative(&g_proj_k, &s, alpha, d_k);
         let gnew_norm = g_proj_new.dot(&g_proj_new).sqrt();
         let gk_norm = g_proj_k.dot(&g_proj_k).sqrt();
         let drop_factor = core.grad_drop_factor;
-        if f_new <= f_k + epsF
+        if core.relaxed_acceptors_enabled()
+            && f_new <= f_k + epsF
             && gnew_norm <= drop_factor * gk_norm
-            && g_proj_new.dot(&d_eff) <= -eps_g(&g_proj_k, &d_eff, core.tau_g)
+            && directional_derivative(&g_proj_new, &s, alpha, d_k)
+                <= -eps_g(&g_proj_k, d_k, core.tau_g)
         {
             return Ok((
                 alpha,
@@ -3952,12 +4559,14 @@ where
         }
 
         // Approximate curvature + flat f acceptance (parity with line_search)
-        let approx_curv_ok = g_proj_new.dot(&d_eff).abs()
+        let approx_curv_ok = directional_derivative(&g_proj_new, &s, alpha, d_k).abs()
             <= core.c2_adapt * gk_dot_eff.abs()
-                + core.curv_slack_scale * eps_g(&g_proj_k, &d_eff, core.tau_g);
-        if f_new <= f_k + epsF
+                + core.curv_slack_scale * eps_g(&g_proj_k, d_k, core.tau_g);
+        if core.relaxed_acceptors_enabled()
+            && f_new <= f_k + epsF
             && approx_curv_ok
-            && g_proj_new.dot(&d_eff) <= -eps_g(&g_proj_k, &d_eff, core.tau_g)
+            && directional_derivative(&g_proj_new, &s, alpha, d_k)
+                <= -eps_g(&g_proj_k, d_k, core.tau_g)
         {
             return Ok((
                 alpha,
@@ -3986,7 +4595,7 @@ where
             alpha *= rho;
         }
         // Stochastic jiggling to avoid hitting identical thresholds repeatedly
-        if core.jiggle_on_flats && no_change_count >= 2 {
+        if core.jiggle_enabled() && no_change_count >= 2 {
             let jiggle = 1.0 + core.jiggle_scale * core.next_rand_sym();
             alpha = (alpha * jiggle).max(f64::EPSILON);
         }
@@ -4002,6 +4611,7 @@ where
         && let Some((a, f, g, kind)) = probe_alphas(
             core,
             obj_fn,
+            oracle,
             x_k,
             d_k,
             f_k,
@@ -4033,12 +4643,13 @@ where
 fn zoom<ObjFn>(
     core: &mut BfgsCore,
     obj_fn: &mut ObjFn,
+    oracle: &mut FirstOrderCache,
     x_k: &Array1<f64>,
     d_k: &Array1<f64>,
     f_k: f64,
     g_k: &Array1<f64>,
     g_proj_k: &Array1<f64>,
-    g_k_dot_d: f64,
+    _g_k_dot_d: f64,
     c1: f64,
     c2: f64,
     mut alpha_lo: f64,
@@ -4051,14 +4662,14 @@ fn zoom<ObjFn>(
     mut grad_evals: usize,
 ) -> LsResult
 where
-    ObjFn: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
+    ObjFn: FirstOrderObjective,
 {
     let max_zoom_attempts = 15;
     let min_alpha_step = 1e-12; // Prevents division by zero or degenerate steps.
     let epsF = eps_f(f_k, core.tau_f);
     let mut best = ProbeBest::new(x_k, f_k, g_k);
-    let mut lo_deriv_known = true;
-    let mut hi_deriv_known = true;
+    let mut lo_deriv_known = g_lo_dot_d.is_finite();
+    let mut hi_deriv_known = g_hi_dot_d.is_finite();
     for _ in 0..max_zoom_attempts {
         let kink_lo = if alpha_lo > 0.0 {
             let (_, _, kink) = core.project_with_step(x_k, d_k, alpha_lo);
@@ -4073,7 +4684,7 @@ where
             false
         };
         if kink_lo || kink_hi {
-            let fallback = backtracking_line_search(core, obj_fn, x_k, d_k, f_k, g_k);
+            let fallback = backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
             return fallback
                 .map(|(a, f, g, fe, ge, kind)| (a, f, g, fe + func_evals, ge + grad_evals, kind));
         }
@@ -4100,14 +4711,21 @@ where
             }
             let (x_j, s_j, kink_mid) = core.project_with_step(x_k, d_k, alpha_j);
             if kink_mid {
-                let fallback = backtracking_line_search(core, obj_fn, x_k, d_k, f_k, g_k);
+                let fallback =
+                    backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
                 return fallback.map(|(a, f, g, fe, ge, kind)| {
                     (a, f, g, fe + func_evals, ge + grad_evals, kind)
                 });
             }
-            let (f_j, g_j) = obj_fn(&x_j);
-            func_evals += 1;
-            grad_evals += 1;
+            let (f_j, g_j) =
+                match bfgs_eval_cost_grad(oracle, obj_fn, &x_j, &mut func_evals, &mut grad_evals)
+                {
+                    Ok(sample) => sample,
+                    Err(ObjectiveEvalError::Recoverable { .. }) => (f64::NAN, Array1::zeros(x_j.len())),
+                    Err(ObjectiveEvalError::Fatal { message }) => {
+                        return Err(LineSearchError::ObjectiveFailed(message));
+                    }
+                };
             if !f_j.is_finite() || g_j.iter().any(|&v| !v.is_finite()) {
                 core.nonfinite_seen = true;
                 if choose_lo {
@@ -4127,28 +4745,19 @@ where
             };
             let g_proj_j = core.projected_gradient(&x_j, &g_j);
             let gkTs = g_proj_k.dot(&s_j);
-            let d_eff = if alpha_j > 0.0 {
-                s_j.mapv(|v| v / alpha_j)
-            } else {
-                d_k.clone()
-            };
-            let gk_dot_d_eff = if alpha_j > 0.0 {
-                g_proj_k.dot(&d_eff)
-            } else {
-                g_k_dot_d
-            };
+            let gk_dot_d_eff = directional_derivative(g_proj_k, &s_j, alpha_j, d_k);
             let armijo_ok = core.accept_nonmonotone(f_k, fmax, gkTs, f_j);
-            let g_j_dot_d = g_proj_j.dot(&d_eff);
+            let g_j_dot_d = directional_derivative(&g_proj_j, &s_j, alpha_j, d_k);
             let curv_ok = g_j_dot_d.abs()
                 <= c2 * gk_dot_d_eff.abs()
-                    + core.curv_slack_scale * eps_g(g_proj_k, &d_eff, core.tau_g);
+                    + core.curv_slack_scale * eps_g(g_proj_k, d_k, core.tau_g);
             let f_flat_ok = f_j <= f_k + epsF;
             let gj_norm = g_proj_j.iter().map(|v| v * v).sum::<f64>().sqrt();
             let gk_norm = g_proj_k.iter().map(|v| v * v).sum::<f64>().sqrt();
             let drop_factor = core.grad_drop_factor;
             let grad_reduce_ok = f_flat_ok
                 && (gj_norm <= drop_factor * gk_norm)
-                && (g_j_dot_d <= -eps_g(g_proj_k, &d_eff, core.tau_g));
+                && (g_j_dot_d <= -eps_g(g_proj_k, d_k, core.tau_g));
             if armijo_ok {
                 return Ok((
                     alpha_j,
@@ -4158,7 +4767,11 @@ where
                     grad_evals,
                     AcceptKind::Nonmonotone,
                 ));
-            } else if f_flat_ok && curv_ok && g_j_dot_d <= -eps_g(g_proj_k, &d_eff, core.tau_g) {
+            } else if core.relaxed_acceptors_enabled()
+                && f_flat_ok
+                && curv_ok
+                && g_j_dot_d <= -eps_g(g_proj_k, d_k, core.tau_g)
+            {
                 return Ok((
                     alpha_j,
                     f_j,
@@ -4167,7 +4780,7 @@ where
                     grad_evals,
                     AcceptKind::ApproxWolfe,
                 ));
-            } else if grad_reduce_ok {
+            } else if core.relaxed_acceptors_enabled() && grad_reduce_ok {
                 return Ok((
                     alpha_j,
                     f_j,
@@ -4200,25 +4813,42 @@ where
             let alpha_mid = 0.5 * (alpha_lo + alpha_hi);
             let (x_mid, s_mid, kink_mid) = core.project_with_step(x_k, d_k, alpha_mid);
             if kink_mid {
-                let fallback = backtracking_line_search(core, obj_fn, x_k, d_k, f_k, g_k);
+                let fallback =
+                    backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
                 return fallback.map(|(a, f, g, fe, ge, kind)| {
                     (a, f, g, fe + func_evals, ge + grad_evals, kind)
                 });
             }
-            let (f_mid, g_mid) = obj_fn(&x_mid);
-            func_evals += 1;
-            grad_evals += 1;
+            let (f_mid, g_mid) = match bfgs_eval_cost_grad(
+                oracle,
+                obj_fn,
+                &x_mid,
+                &mut func_evals,
+                &mut grad_evals,
+            ) {
+                Ok(sample) => sample,
+                Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    core.nonfinite_seen = true;
+                    let tighten_lo = g_lo_dot_d.abs() > g_hi_dot_d.abs();
+                    if tighten_lo {
+                        alpha_lo = alpha_mid;
+                        lo_deriv_known = false;
+                    } else {
+                        alpha_hi = alpha_mid;
+                        hi_deriv_known = false;
+                    }
+                    continue;
+                }
+                Err(ObjectiveEvalError::Fatal { message }) => {
+                    return Err(LineSearchError::ObjectiveFailed(message));
+                }
+            };
             if f_mid.is_finite() && g_mid.iter().all(|v| v.is_finite()) {
                 // Optional midpoint acceptance in flat, similar-slope brackets (guard with descent sign)
                 let g_proj_mid = core.projected_gradient(&x_mid, &g_mid);
-                let d_eff = if alpha_mid > 0.0 {
-                    s_mid.mapv(|v| v / alpha_mid)
-                } else {
-                    d_k.clone()
-                };
-                let g_mid_dot_d = g_proj_mid.dot(&d_eff);
-                let dir_ok = g_mid_dot_d <= -eps_g(g_proj_k, &d_eff, core.tau_g);
-                if core.accept_flat_midpoint_once && dir_ok {
+                let g_mid_dot_d = directional_derivative(&g_proj_mid, &s_mid, alpha_mid, d_k);
+                let dir_ok = g_mid_dot_d <= -eps_g(g_proj_k, d_k, core.tau_g);
+                if core.midpoint_acceptance_enabled() && dir_ok {
                     return Ok((
                         alpha_mid,
                         f_mid,
@@ -4235,14 +4865,10 @@ where
                 };
                 let gkTs = g_proj_k.dot(&s_mid);
                 let armijo_ok = core.accept_nonmonotone(f_k, fmax, gkTs, f_mid);
-                let gk_dot_d_eff = if alpha_mid > 0.0 {
-                    g_proj_k.dot(&d_eff)
-                } else {
-                    g_k_dot_d
-                };
+                let gk_dot_d_eff = directional_derivative(g_proj_k, &s_mid, alpha_mid, d_k);
                 let curv_ok = g_mid_dot_d.abs()
                     <= c2 * gk_dot_d_eff.abs()
-                        + core.curv_slack_scale * eps_g(g_proj_k, &d_eff, core.tau_g);
+                        + core.curv_slack_scale * eps_g(g_proj_k, d_k, core.tau_g);
                 let gdrop = g_proj_mid.iter().map(|v| v * v).sum::<f64>().sqrt()
                     <= core.grad_drop_factor * g_proj_k.iter().map(|v| v * v).sum::<f64>().sqrt();
                 if armijo_ok && curv_ok {
@@ -4254,7 +4880,7 @@ where
                         grad_evals,
                         AcceptKind::Nonmonotone,
                     ));
-                } else if f_mid <= f_k + epsF && gdrop && dir_ok {
+                } else if core.relaxed_acceptors_enabled() && f_mid <= f_k + epsF && gdrop && dir_ok {
                     return Ok((
                         alpha_mid,
                         f_mid,
@@ -4350,17 +4976,21 @@ where
 
         let (x_j, s_j, kink_j) = core.project_with_step(x_k, d_k, alpha_j);
         if kink_j {
-            let fallback = backtracking_line_search(core, obj_fn, x_k, d_k, f_k, g_k);
+            let fallback = backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
             return fallback
                 .map(|(a, f, g, fe, ge, kind)| (a, f, g, fe + func_evals, ge + grad_evals, kind));
         }
-        let (f_j, g_j) = obj_fn(&x_j);
-        func_evals += 1;
-        grad_evals += 1;
-        best.consider(&x_j, f_j, &g_j);
+        let mut f_j = match bfgs_eval_cost(oracle, obj_fn, &x_j, &mut func_evals)
+        {
+            Ok(f) => f,
+            Err(ObjectiveEvalError::Recoverable { .. }) => f64::NAN,
+            Err(ObjectiveEvalError::Fatal { message }) => {
+                return Err(LineSearchError::ObjectiveFailed(message));
+            }
+        };
 
         // Handle non-finite by shrinking toward the finite end; keep derivative info intact
-        if !f_j.is_finite() || g_j.iter().any(|&v| !v.is_finite()) {
+        if !f_j.is_finite() {
             core.nonfinite_seen = true;
             // Move the bound closer to alpha_j, prefer shrinking the side that alpha_j is nearer to
             let to_hi = (alpha_hi - alpha_j).abs() <= (alpha_j - alpha_lo).abs();
@@ -4383,31 +5013,66 @@ where
         } else {
             core.gll.fmax()
         };
-        let g_proj_j = core.projected_gradient(&x_j, &g_j);
         let gkTs = g_proj_k.dot(&s_j);
-        let d_eff = if alpha_j > 0.0 {
-            s_j.mapv(|v| v / alpha_j)
-        } else {
-            d_k.clone()
-        };
-        let gk_dot_d_eff = if alpha_j > 0.0 {
-            g_proj_k.dot(&d_eff)
-        } else {
-            g_k_dot_d
-        };
+        let gk_dot_d_eff = directional_derivative(g_proj_k, &s_j, alpha_j, d_k);
         let armijo_ok = f_j <= f_k + c1 * gkTs + epsF;
         let armijo_gll_ok = f_j <= fmax + c1 * gkTs + epsF;
-        if !f_j.is_finite() || (!armijo_ok && !armijo_gll_ok) || f_j >= f_lo - epsF {
-            if !f_j.is_finite() {
-                core.nonfinite_seen = true;
-            }
-            // The new point is not good enough, shrink the interval from the high end.
+        if (!armijo_ok && !armijo_gll_ok) || f_j >= f_lo - epsF {
             alpha_hi = alpha_j;
             f_hi = f_j;
-            g_hi_dot_d = g_proj_j.dot(&d_eff);
-            hi_deriv_known = true;
+            hi_deriv_known = false;
         } else {
-            let g_j_dot_d = g_proj_j.dot(&d_eff);
+            let (f_full, g_j) =
+                match bfgs_eval_cost_grad(oracle, obj_fn, &x_j, &mut func_evals, &mut grad_evals)
+                {
+                    Ok(sample) => sample,
+                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                        core.nonfinite_seen = true;
+                        let to_hi = (alpha_hi - alpha_j).abs() <= (alpha_j - alpha_lo).abs();
+                        if to_hi {
+                            alpha_hi = alpha_j;
+                            f_hi = f64::NAN;
+                            hi_deriv_known = false;
+                        } else {
+                            alpha_lo = alpha_j;
+                            f_lo = f64::NAN;
+                            lo_deriv_known = false;
+                        }
+                        continue;
+                    }
+                    Err(ObjectiveEvalError::Fatal { message }) => {
+                        return Err(LineSearchError::ObjectiveFailed(message));
+                    }
+                };
+            f_j = f_full;
+            if !f_j.is_finite() || g_j.iter().any(|&v| !v.is_finite()) {
+                core.nonfinite_seen = true;
+                let to_hi = (alpha_hi - alpha_j).abs() <= (alpha_j - alpha_lo).abs();
+                if to_hi {
+                    alpha_hi = alpha_j;
+                    f_hi = f_j;
+                    hi_deriv_known = false;
+                } else {
+                    alpha_lo = alpha_j;
+                    f_lo = f_j;
+                    lo_deriv_known = false;
+                }
+                continue;
+            }
+            best.consider(&x_j, f_j, &g_j);
+            let armijo_ok = f_j <= f_k + c1 * gkTs + epsF;
+            let armijo_gll_ok = f_j <= fmax + c1 * gkTs + epsF;
+            if (!armijo_ok && !armijo_gll_ok) || f_j >= f_lo - epsF {
+                alpha_hi = alpha_j;
+                f_hi = f_j;
+                let g_proj_j = core.projected_gradient(&x_j, &g_j);
+                g_hi_dot_d = directional_derivative(&g_proj_j, &s_j, alpha_j, d_k);
+                hi_deriv_known = true;
+                continue;
+            }
+
+            let g_proj_j = core.projected_gradient(&x_j, &g_j);
+            let g_j_dot_d = directional_derivative(&g_proj_j, &s_j, alpha_j, d_k);
             // Check the curvature condition.
             if g_j_dot_d.abs() <= c2 * gk_dot_d_eff.abs() {
                 return Ok((
@@ -4418,9 +5083,10 @@ where
                     grad_evals,
                     AcceptKind::StrongWolfe,
                 ));
-            } else if g_j_dot_d.abs()
-                <= c2 * gk_dot_d_eff.abs()
-                    + core.curv_slack_scale * eps_g(g_proj_k, &d_eff, core.tau_g)
+            } else if core.relaxed_acceptors_enabled()
+                && g_j_dot_d.abs()
+                    <= c2 * gk_dot_d_eff.abs()
+                        + core.curv_slack_scale * eps_g(g_proj_k, d_k, core.tau_g)
                 && f_j <= f_k + epsF
             {
                 return Ok((
@@ -4435,7 +5101,7 @@ where
 
             // The minimum is bracketed by a point with a negative derivative
             // (alpha_lo) and a point with a positive derivative (alpha_j).
-            if g_j_dot_d >= -eps_g(g_proj_k, &d_eff, core.tau_g) {
+            if g_j_dot_d >= -eps_g(g_proj_k, d_k, core.tau_g) {
                 // The new point has a positive derivative and a lower function value,
                 // so it becomes the new best (low) point and the old low becomes high.
                 alpha_hi = alpha_lo;
@@ -4461,6 +5127,7 @@ where
     if let Some((a, f, g, kind)) = probe_alphas(
         core,
         obj_fn,
+        oracle,
         x_k,
         d_k,
         f_k,
@@ -4484,6 +5151,7 @@ where
 fn probe_alphas<ObjFn>(
     core: &mut BfgsCore,
     obj_fn: &mut ObjFn,
+    oracle: &mut FirstOrderCache,
     x_k: &Array1<f64>,
     d_k: &Array1<f64>,
     f_k: f64,
@@ -4496,29 +5164,25 @@ fn probe_alphas<ObjFn>(
     ge: &mut usize,
 ) -> Option<(f64, f64, Array1<f64>, AcceptKind)>
 where
-    ObjFn: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
+    ObjFn: FirstOrderObjective,
 {
     let cands = [0.2, 0.5, 0.8].map(|t| a_lo + t * (a_hi - a_lo));
     let g_proj_k = core.projected_gradient(x_k, g_k);
     let gk_norm = g_proj_k.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let epsF = eps_f(f_k, core.tau_f);
     let mut best: Option<(f64, f64, Array1<f64>, AcceptKind)> = None;
     for &a in &cands {
         if !a.is_finite() || a <= 0.0 {
             continue;
         }
-        let (x, s, kinked) = core.project_with_step(x_k, d_k, a);
-        let (f, g) = obj_fn(&x);
-        *fe += 1;
-        *ge += 1;
-        if !f.is_finite() || g.iter().any(|v| !v.is_finite()) {
+        let (x, s, _) = core.project_with_step(x_k, d_k, a);
+        let f = match bfgs_eval_cost(oracle, obj_fn, &x, fe) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if !f.is_finite() {
             continue;
         }
-        let g_proj = core.projected_gradient(&x, &g);
-        let d_eff = if kinked && a > 0.0 {
-            s.mapv(|v| v / a)
-        } else {
-            d_k.clone()
-        };
         let gkTs = g_proj_k.dot(&s);
         let fmax = if core.gll.is_empty() {
             f_k
@@ -4526,9 +5190,21 @@ where
             core.gll.fmax()
         };
         let ok_f = core.accept_nonmonotone(f_k, fmax, gkTs, f);
+        let flat_f = f <= f_k + epsF;
+        if !ok_f && !(core.relaxed_acceptors_enabled() && flat_f) {
+            continue;
+        }
+        let (f, g) = match bfgs_eval_cost_grad(oracle, obj_fn, &x, fe, ge) {
+            Ok(sample) => sample,
+            Err(_) => continue,
+        };
+        if !f.is_finite() || g.iter().any(|v| !v.is_finite()) {
+            continue;
+        }
+        let g_proj = core.projected_gradient(&x, &g);
         let gi_norm = g_proj.dot(&g_proj).sqrt();
-        let dir_ok = g_proj.dot(&d_eff) <= -eps_g(&g_proj_k, &d_eff, tau_g);
-        let ok_g = gi_norm <= drop_factor * gk_norm && dir_ok;
+        let dir_ok = directional_derivative(&g_proj, &s, a, d_k) <= -eps_g(&g_proj_k, d_k, tau_g);
+        let ok_g = core.relaxed_acceptors_enabled() && flat_f && gi_norm <= drop_factor * gk_norm && dir_ok;
         if (ok_f || ok_g) && best.as_ref().map(|(fb, _, _, _)| f < *fb).unwrap_or(true) {
             let kind = if ok_g {
                 AcceptKind::GradDrop
@@ -4554,8 +5230,9 @@ mod tests {
     //    that our results (final point and iteration count) are equivalent.
 
     use super::{
-        ArcError, BACKTRACKING_MAX_ATTEMPTS, Bfgs, BfgsError, BfgsSolution,
-        LineSearchFailureReason, NewtonTrustRegion, ObjectiveSample,
+        ArcAcceptance, ArcError, BACKTRACKING_MAX_ATTEMPTS, Bfgs, BfgsError, BfgsSolution,
+        Bounds, LineSearchFailureReason, MaxIterations, NewtonTrustRegion, ObjectiveEvalError,
+        ObjectiveRequest, ObjectiveSample, SigmaUpdate, SigmaValue, Tolerance,
     };
     use ndarray::{Array1, Array2, array};
     use spectral::prelude::*;
@@ -4678,6 +5355,48 @@ mod tests {
         (x.dot(x), 2.0 * x)
     }
 
+    fn bfgs_oracle<F>(
+        mut fg: F,
+    ) -> impl FnMut(&Array1<f64>, ObjectiveRequest) -> Result<ObjectiveSample, ObjectiveEvalError>
+    where
+        F: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
+    {
+        move |x, req| {
+            let (f, g) = fg(x);
+            match req {
+                ObjectiveRequest::CostOnly => Ok(ObjectiveSample::cost_only(f)),
+                ObjectiveRequest::CostAndGradient => Ok(ObjectiveSample::cost_and_gradient(f, g)),
+                _ => Err(ObjectiveEvalError::recoverable(
+                    "test oracle does not provide Hessians",
+                )),
+            }
+        }
+    }
+
+    fn tol(value: f64) -> Tolerance {
+        Tolerance::new(value).unwrap()
+    }
+
+    fn iters(value: usize) -> MaxIterations {
+        MaxIterations::new(value).unwrap()
+    }
+
+    fn bounds(lower: Array1<f64>, upper: Array1<f64>, tol: f64) -> Bounds {
+        Bounds::new(lower, upper, tol).unwrap()
+    }
+
+    fn sigma(value: f64) -> SigmaValue {
+        SigmaValue::new(value).unwrap()
+    }
+
+    fn arc_accept(eta1: f64, eta2: f64) -> ArcAcceptance {
+        ArcAcceptance::new(eta1, eta2).unwrap()
+    }
+
+    fn sigma_update(gamma1: f64, gamma2: f64, gamma3: f64) -> SigmaUpdate {
+        SigmaUpdate::new(gamma1, gamma2, gamma3).unwrap()
+    }
+
     /// The Rosenbrock function, a classic non-convex benchmark with a minimum at [1, 1].
     fn rosenbrock(x: &Array1<f64>) -> (f64, Array1<f64>) {
         let a = 1.0;
@@ -4730,19 +5449,226 @@ mod tests {
     }
 
     #[test]
+    fn objective_oracle_cache_reuses_same_point_full_sample() {
+        let x = array![1.0, -2.0];
+        let call_count = Arc::new(Mutex::new(0usize));
+        let call_count_c = call_count.clone();
+        let mut oracle = super::ObjectiveOracleCache::new();
+        let mut func_evals = 0usize;
+        let mut grad_evals = 0usize;
+        let mut obj = move |x: &Array1<f64>, req| {
+            *call_count_c.lock().expect("lock call count") += 1;
+            let f = x.dot(x);
+            let g = 2.0 * x;
+            let h = Array2::<f64>::eye(x.len()) * 2.0;
+            match req {
+                super::ObjectiveRequest::CostOnly => Ok(ObjectiveSample::cost_only(f)),
+                super::ObjectiveRequest::CostAndGradient => {
+                    Ok(ObjectiveSample::cost_and_gradient(f, g))
+                }
+                super::ObjectiveRequest::GradientAndHessian
+                | super::ObjectiveRequest::CostGradientHessian => {
+                    Ok(ObjectiveSample::cost_gradient_hessian(f, g, h))
+                }
+            }
+        };
+
+        let first = oracle
+            .eval(
+                &mut obj,
+                &x,
+                super::ObjectiveRequest::CostGradientHessian,
+                &mut func_evals,
+                &mut grad_evals,
+            )
+            .expect("initial full sample should succeed");
+        let second = oracle
+            .eval(
+                &mut obj,
+                &x,
+                super::ObjectiveRequest::GradientAndHessian,
+                &mut func_evals,
+                &mut grad_evals,
+            )
+            .expect("same-point derivative request should hit cache");
+
+        assert_eq!(*call_count.lock().expect("lock call count"), 1);
+        assert_eq!(func_evals, 1);
+        assert_eq!(grad_evals, 1);
+        assert_eq!(first.cost, second.cost);
+        assert!(second.gradient.is_some());
+        assert!(second.hessian.is_some());
+    }
+
+    #[test]
+    fn objective_oracle_cache_merges_same_point_requests() {
+        let x = array![0.5];
+        let call_count = Arc::new(Mutex::new(0usize));
+        let call_count_c = call_count.clone();
+        let mut oracle = super::ObjectiveOracleCache::new();
+        let mut func_evals = 0usize;
+        let mut grad_evals = 0usize;
+        let mut obj = move |x: &Array1<f64>, req| {
+            *call_count_c.lock().expect("lock call count") += 1;
+            let f = 0.5 * x[0] * x[0];
+            let g = array![x[0]];
+            let h = array![[1.0]];
+            match req {
+                super::ObjectiveRequest::CostOnly => Ok(ObjectiveSample::cost_only(f)),
+                super::ObjectiveRequest::CostAndGradient => {
+                    Ok(ObjectiveSample::cost_and_gradient(f, g))
+                }
+                super::ObjectiveRequest::GradientAndHessian
+                | super::ObjectiveRequest::CostGradientHessian => {
+                    Ok(ObjectiveSample::cost_gradient_hessian(f, g, h))
+                }
+            }
+        };
+
+        let cost_only = oracle
+            .eval(
+                &mut obj,
+                &x,
+                super::ObjectiveRequest::CostOnly,
+                &mut func_evals,
+                &mut grad_evals,
+            )
+            .expect("cost-only request should succeed");
+        let full = oracle
+            .eval(
+                &mut obj,
+                &x,
+                super::ObjectiveRequest::CostGradientHessian,
+                &mut func_evals,
+                &mut grad_evals,
+            )
+            .expect("full request should succeed");
+        let cached_grad_hess = oracle
+            .eval(
+                &mut obj,
+                &x,
+                super::ObjectiveRequest::GradientAndHessian,
+                &mut func_evals,
+                &mut grad_evals,
+            )
+            .expect("merged same-point request should hit cache");
+
+        assert_eq!(*call_count.lock().expect("lock call count"), 2);
+        assert_eq!(func_evals, 2);
+        assert_eq!(grad_evals, 1);
+        assert_eq!(cost_only.cost, full.cost);
+        assert!(cached_grad_hess.gradient.is_some());
+        assert!(cached_grad_hess.hessian.is_some());
+    }
+
+    #[test]
+    fn dense_solve_shifted_solves_small_system() {
+        let a = array![[4.0, 1.0], [1.0, 3.0]];
+        let b = array![1.0, 2.0];
+        let x = super::dense_solve_shifted(&a, &b, 0.0).expect("dense solve should succeed");
+        let ax = a.dot(&x);
+        assert!((&ax - &b).iter().all(|v| v.abs() < 1e-10));
+    }
+
+    #[test]
+    fn cg_solve_adaptive_uses_direct_path_for_small_dense_systems() {
+        let n = 8usize;
+        let mut a = Array2::<f64>::eye(n) * 3.0;
+        for i in 0..n {
+            for j in 0..n {
+                if i != j {
+                    a[[i, j]] = 0.05 * ((i + j + 1) as f64);
+                }
+            }
+        }
+        let b = Array1::from_iter((0..n).map(|i| (i + 1) as f64));
+        let x = super::cg_solve_adaptive(&a, &b, 5, 1e-12, 1e-10)
+            .expect("small dense system should use the direct solve path");
+        let mut ax = a.dot(&x);
+        for i in 0..n {
+            ax[i] += 1e-10 * x[i];
+        }
+        let residual = (&ax - &b).dot(&(&ax - &b)).sqrt();
+        assert!(residual < 1e-8, "expected small residual, got {residual:e}");
+    }
+
+    #[test]
+    fn cg_solve_from_refines_existing_iterate() {
+        let n = 256usize;
+        let mut a = Array2::<f64>::eye(n) * 4.0;
+        for i in 0..(n - 1) {
+            a[[i, i + 1]] = 0.5;
+            a[[i + 1, i]] = 0.5;
+        }
+        let b = Array1::from_elem(n, 1.0);
+        let first = super::cg_solve_from(&a, &b, Array1::zeros(n), 3, 1e-12, 0.0)
+            .expect("initial CG stage should succeed");
+        let second = super::cg_solve_from(&a, &b, first.x.clone(), 3, 1e-12, 0.0)
+            .expect("refinement CG stage should succeed");
+        assert!(
+            second.rel_resid < first.rel_resid,
+            "continued CG should improve residual"
+        );
+    }
+
+    #[test]
+    fn steihaug_toint_uses_exact_small_dense_newton_step_when_feasible() {
+        let core = super::NewtonTrustRegionCore::new(array![0.0, 0.0]);
+        let h = array![[4.0, 1.0], [1.0, 3.0]];
+        let g = array![1.0, 2.0];
+        let rhs = -g.clone();
+        let expected =
+            super::dense_solve_shifted(&h, &rhs, 0.0).expect("direct dense solve should work");
+        let (step, pred) = core
+            .steihaug_toint_step(&h, &g, 10.0, None)
+            .expect("small dense exact step should be accepted");
+        assert!((&step - &expected).iter().all(|v| v.abs() < 1e-10));
+        assert!(pred > 0.0);
+    }
+
+    #[test]
+    fn bfgs_local_mode_forces_strict_search_policy() {
+        let mut core = super::BfgsCore::new(array![0.0, 0.0]);
+        core.initial_grad_norm = 10.0;
+        core.primary_strategy = super::LineSearchStrategy::Backtracking;
+        core.c1_adapt = 1e-3;
+        core.c2_adapt = 0.1;
+        core.flat_accept_streak = 3;
+        core.curv_slack_scale = 0.25;
+        core.grad_drop_factor = 0.95;
+        core.gll.set_cap(8);
+
+        core.refresh_local_mode(1e-3);
+
+        assert!(core.local_mode);
+        assert!(matches!(
+            core.primary_strategy,
+            super::LineSearchStrategy::StrongWolfe
+        ));
+        assert!((core.c1_adapt - core.c1).abs() < 1e-16);
+        assert!((core.c2_adapt - core.c2).abs() < 1e-16);
+        assert_eq!(core.flat_accept_streak, 0);
+        assert!((core.curv_slack_scale - 1.0).abs() < 1e-16);
+        assert!((core.grad_drop_factor - 0.9).abs() < 1e-16);
+        assert_eq!(core.gll.cap, 1);
+    }
+
+    #[test]
     fn probe_alphas_respects_armijo() {
         let x_k = array![1.0];
         let f_k = 1.0;
         let g_k = array![2.0];
         let d_k = array![2.0]; // ascent direction
         let mut core = super::BfgsCore::new(x_k.clone());
+        let mut oracle = super::ObjectiveOracleCache::new();
         let tau_g = core.tau_g;
         let drop_factor = core.grad_drop_factor;
         let mut fe = 0usize;
         let mut ge = 0usize;
         let res = super::probe_alphas(
             &mut core,
-            &mut |x: &Array1<f64>| (x.dot(x), 2.0 * x),
+            &mut bfgs_oracle(|x: &Array1<f64>| (x.dot(x), 2.0 * x)),
+            &mut oracle,
             &x_k,
             &d_k,
             f_k,
@@ -4761,19 +5687,31 @@ mod tests {
     fn line_search_ignores_nonfinite_best() {
         let x0 = array![0.0];
         let mut core = super::BfgsCore::new(x0.clone());
+        let mut oracle = super::ObjectiveOracleCache::new();
         let c1 = core.c1;
         let c2 = core.c2;
-        let mut obj = |x: &Array1<f64>| {
+        let fg = |x: &Array1<f64>| {
             if x[0] > 0.0 {
                 (f64::NEG_INFINITY, array![1.0])
             } else {
                 (0.0, array![1.0])
             }
         };
-        let (f_k, g_k) = obj(&x0);
+        let (f_k, g_k) = fg(&x0);
+        let mut obj = bfgs_oracle(fg);
         core.global_best = Some(super::ProbeBest::new(&x0, f_k, &g_k));
         let d_k = array![1.0];
-        let r = super::line_search(&mut core, &mut obj, &x0, &d_k, f_k, &g_k, c1, c2);
+        let r = super::line_search(
+            &mut core,
+            &mut obj,
+            &mut oracle,
+            &x0,
+            &d_k,
+            f_k,
+            &g_k,
+            c1,
+            c2,
+        );
         assert!(r.is_err());
         assert!(
             core.global_best
@@ -4790,8 +5728,8 @@ mod tests {
             let (f, g, h) = rosenbrock_with_hessian(x);
             Ok(ObjectiveSample::cost_gradient_hessian(f, g, h))
         })
-        .with_tolerance(1e-8)
-        .with_max_iterations(100);
+        .with_tolerance(tol(1e-8))
+        .with_max_iterations(iters(100));
         let solution = solver.run().expect("Newton trust-region should converge");
         assert!((solution.final_point[0] - 1.0).abs() < 1e-6);
         assert!((solution.final_point[1] - 1.0).abs() < 1e-6);
@@ -4799,17 +5737,17 @@ mod tests {
     }
 
     #[test]
-    fn newton_trust_region_uses_cost_only_requests() {
+    fn newton_trust_region_uses_single_full_trial_requests() {
         let x0 = array![-1.2, 1.0];
-        let counts = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
+        let counts = Arc::new(Mutex::new((0usize, 0usize, 0usize, 0usize)));
         let counts_c = counts.clone();
         let mut solver = NewtonTrustRegion::new(x0, move |x, req| {
             let mut c = counts_c.lock().expect("lock counts");
             match req {
                 super::ObjectiveRequest::CostOnly => c.0 += 1,
                 super::ObjectiveRequest::CostAndGradient => c.1 += 1,
-                super::ObjectiveRequest::GradientAndHessian
-                | super::ObjectiveRequest::CostGradientHessian => c.2 += 1,
+                super::ObjectiveRequest::GradientAndHessian => c.2 += 1,
+                super::ObjectiveRequest::CostGradientHessian => c.3 += 1,
             }
             let (f, g, h) = rosenbrock_with_hessian(x);
             match req {
@@ -4823,12 +5761,16 @@ mod tests {
                 }
             }
         })
-        .with_tolerance(1e-8)
-        .with_max_iterations(100);
+        .with_tolerance(tol(1e-8))
+        .with_max_iterations(iters(100));
         let _ = solver.run().expect("Newton trust-region should converge");
         let c = counts.lock().expect("lock counts");
-        assert!(c.0 > 0, "expected at least one CostOnly request");
-        assert!(c.2 > 0, "expected at least one CostGradientHessian request");
+        assert_eq!(c.0, 0, "Newton TR trial points should not use CostOnly requests");
+        assert_eq!(
+            c.2, 0,
+            "Newton TR accepted steps should not do a second GradientAndHessian refresh"
+        );
+        assert!(c.3 > 0, "expected Newton TR to use CostGradientHessian requests");
     }
 
     #[test]
@@ -4847,8 +5789,8 @@ mod tests {
                 }
             }
         })
-        .with_tolerance(1e-7)
-        .with_max_iterations(200);
+        .with_tolerance(tol(1e-7))
+        .with_max_iterations(iters(200));
 
         let sol = solver
             .run()
@@ -4879,9 +5821,9 @@ mod tests {
                 }
             }
         })
-        .with_bounds(lower, upper, 1e-8)
-        .with_tolerance(1e-10)
-        .with_max_iterations(100);
+        .with_bounds(bounds(lower, upper, 1e-8))
+        .with_tolerance(tol(1e-10))
+        .with_max_iterations(iters(100));
 
         let sol = solver
             .run()
@@ -4913,9 +5855,9 @@ mod tests {
                 }
             }
         })
-        .with_bounds(lower, upper, 1e-8)
-        .with_tolerance(1e-9)
-        .with_max_iterations(100);
+        .with_bounds(bounds(lower, upper, 1e-8))
+        .with_tolerance(tol(1e-9))
+        .with_max_iterations(iters(100));
 
         let sol = solver.run().expect("Projected Newton should converge");
         assert!((sol.final_point[0] - 1.0).abs() < 1e-8);
@@ -4949,8 +5891,8 @@ mod tests {
                 }
             }
         })
-        .with_tolerance(1e-6)
-        .with_max_iterations(300)
+        .with_tolerance(tol(1e-6))
+        .with_max_iterations(iters(300))
         .with_bfgs_fallback(true)
         .with_fallback_history(10);
 
@@ -4987,8 +5929,8 @@ mod tests {
                 }
             }
         })
-        .with_tolerance(1e-8)
-        .with_max_iterations(200)
+        .with_tolerance(tol(1e-8))
+        .with_max_iterations(iters(200))
         .with_bfgs_fallback(false);
 
         let sol = solver
@@ -5006,7 +5948,7 @@ mod tests {
                 "fatal synthetic objective failure",
             ))
         })
-        .with_max_iterations(5);
+        .with_max_iterations(iters(5));
 
         let err = solver.run().expect_err("fatal errors must propagate");
         match err {
@@ -5034,7 +5976,7 @@ mod tests {
                 }
             }
         })
-        .with_max_iterations(10)
+        .with_max_iterations(iters(10))
         .with_bfgs_fallback(false);
 
         let err = solver
@@ -5053,12 +5995,12 @@ mod tests {
             let (f, g, h) = rosenbrock_with_hessian(x);
             Ok(ObjectiveSample::cost_gradient_hessian(f, g, h))
         })
-        .with_tolerance(1e-7)
-        .with_max_iterations(250)
+        .with_tolerance(tol(1e-7))
+        .with_max_iterations(iters(250))
         .with_theta(1.0)
-        .with_initial_sigma(1.0)
-        .with_acceptance_thresholds(0.1, 0.9)
-        .with_sigma_update_factors(0.5, 2.0, 4.0);
+        .with_initial_sigma(sigma(1.0))
+        .with_acceptance_thresholds(arc_accept(0.1, 0.9))
+        .with_sigma_update_factors(sigma_update(0.5, 2.0, 4.0));
 
         let solution = solver.run().expect("ARC should converge");
         assert!((solution.final_point[0] - 1.0).abs() < 1e-4);
@@ -5067,17 +6009,17 @@ mod tests {
     }
 
     #[test]
-    fn arc_uses_cost_only_requests() {
+    fn arc_uses_single_full_trial_requests() {
         let x0 = array![-1.2, 1.0];
-        let counts = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
+        let counts = Arc::new(Mutex::new((0usize, 0usize, 0usize, 0usize)));
         let counts_c = counts.clone();
         let mut solver = super::Arc::new(x0, move |x, req| {
             let mut c = counts_c.lock().expect("lock counts");
             match req {
                 super::ObjectiveRequest::CostOnly => c.0 += 1,
                 super::ObjectiveRequest::CostAndGradient => c.1 += 1,
-                super::ObjectiveRequest::GradientAndHessian
-                | super::ObjectiveRequest::CostGradientHessian => c.2 += 1,
+                super::ObjectiveRequest::GradientAndHessian => c.2 += 1,
+                super::ObjectiveRequest::CostGradientHessian => c.3 += 1,
             }
             let (f, g, h) = rosenbrock_with_hessian(x);
             match req {
@@ -5091,13 +6033,165 @@ mod tests {
                 }
             }
         })
-        .with_tolerance(1e-7)
-        .with_max_iterations(250);
+        .with_tolerance(tol(1e-7))
+        .with_max_iterations(iters(250));
 
         let _ = solver.run().expect("ARC should converge");
         let c = counts.lock().expect("lock counts");
-        assert!(c.0 > 0, "expected at least one CostOnly request");
-        assert!(c.2 > 0, "expected at least one Hessian-bearing request");
+        assert_eq!(c.0, 0, "ARC trial points should not use CostOnly requests");
+        assert_eq!(
+            c.2, 0,
+            "ARC accepted steps should not do a second GradientAndHessian refresh"
+        );
+        assert!(c.3 > 0, "expected ARC to use CostGradientHessian requests");
+    }
+
+    #[test]
+    fn arc_accepted_step_uses_single_evaluation() {
+        let counts = Arc::new(Mutex::new((0usize, 0usize, 0usize, 0usize)));
+        let counts_c = counts.clone();
+        let mut solver = super::Arc::new(array![1.0], move |x, req| {
+            let mut c = counts_c.lock().expect("lock counts");
+            match req {
+                super::ObjectiveRequest::CostOnly => c.0 += 1,
+                super::ObjectiveRequest::CostAndGradient => c.1 += 1,
+                super::ObjectiveRequest::GradientAndHessian => c.2 += 1,
+                super::ObjectiveRequest::CostGradientHessian => c.3 += 1,
+            }
+            let f = 0.5 * x[0] * x[0];
+            let g = array![x[0]];
+            let h = array![[1.0]];
+            match req {
+                super::ObjectiveRequest::CostOnly => Ok(ObjectiveSample::cost_only(f)),
+                super::ObjectiveRequest::CostAndGradient => {
+                    Ok(ObjectiveSample::cost_and_gradient(f, g))
+                }
+                super::ObjectiveRequest::GradientAndHessian => Ok(ObjectiveSample {
+                    cost: f64::NAN,
+                    gradient: Some(g),
+                    hessian: Some(h),
+                }),
+                super::ObjectiveRequest::CostGradientHessian => {
+                    Ok(ObjectiveSample::cost_gradient_hessian(f, g, h))
+                }
+            }
+        })
+        .with_tolerance(tol(1e-9))
+        .with_max_iterations(iters(1))
+        .with_bfgs_fallback(false);
+
+        let err = solver
+            .run()
+            .expect_err("one ARC iteration should exhaust the budget after a single accepted step");
+        match err {
+            ArcError::MaxIterationsReached { .. } => {}
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        let c = counts.lock().expect("lock counts");
+        assert_eq!(c.0, 0, "ARC should not issue CostOnly requests");
+        assert_eq!(c.1, 0, "ARC should not issue CostAndGradient requests");
+        assert_eq!(c.2, 0, "ARC should not issue GradientAndHessian requests");
+        assert_eq!(c.3, 2, "expected one initial and one trial CostGradientHessian sample");
+    }
+
+    #[test]
+    fn arc_rejects_materially_projected_steps() {
+        let x0 = array![0.8];
+        let lower = array![0.0];
+        let upper = array![1.0];
+        let clipped_counts = Arc::new(Mutex::new((0usize, 0usize)));
+        let clipped_counts_c = clipped_counts.clone();
+        let mut solver = super::Arc::new(x0.clone(), move |x, req| {
+            if (x[0] - 1.0).abs() < 1e-12 {
+                let mut counts = clipped_counts_c.lock().expect("lock clipped counts");
+                match req {
+                    super::ObjectiveRequest::CostOnly => counts.0 += 1,
+                    super::ObjectiveRequest::CostGradientHessian => counts.1 += 1,
+                    _ => {}
+                }
+            }
+            let dx = x[0] - 2.0;
+            let f = 0.5 * dx * dx;
+            let g = array![dx];
+            let h = array![[1.0]];
+            match req {
+                super::ObjectiveRequest::CostOnly => Ok(ObjectiveSample::cost_only(f)),
+                super::ObjectiveRequest::CostAndGradient => {
+                    Ok(ObjectiveSample::cost_and_gradient(f, g))
+                }
+                super::ObjectiveRequest::GradientAndHessian
+                | super::ObjectiveRequest::CostGradientHessian => {
+                    Ok(ObjectiveSample::cost_gradient_hessian(f, g, h))
+                }
+            }
+        })
+        .with_bounds(bounds(lower, upper, 1e-12))
+        .with_initial_sigma(sigma(1e-12))
+        .with_max_iterations(iters(1))
+        .with_bfgs_fallback(false);
+
+        let err = solver
+            .run()
+            .expect_err("single projected iteration should exhaust the budget");
+        match err {
+            ArcError::MaxIterationsReached { last_solution } => {
+                assert!(last_solution.final_point[0] <= 1.0 + 1e-12);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        let counts = clipped_counts.lock().expect("lock clipped counts");
+        assert_eq!(
+            counts.0, 0,
+            "materially projected ARC steps must not use CostOnly rho evaluation"
+        );
+        assert!(
+            counts.1 > 0,
+            "materially projected ARC steps should refresh a coherent CostGradientHessian sample"
+        );
+    }
+
+    #[test]
+    fn arc_fallback_starts_from_accepted_trial_point() {
+        let x0 = array![1.0];
+        let seen_points = Arc::new(Mutex::new(Vec::<f64>::new()));
+        let seen_points_c = seen_points.clone();
+        let mut solver = super::Arc::new(x0, move |x, req| {
+            seen_points_c.lock().expect("lock seen points").push(x[0]);
+            let f = 0.5 * x[0] * x[0];
+            let g = array![x[0]];
+            let h = array![[1.0]];
+            match req {
+                super::ObjectiveRequest::CostOnly => Ok(ObjectiveSample::cost_only(f)),
+                super::ObjectiveRequest::CostAndGradient => {
+                    Ok(ObjectiveSample::cost_and_gradient(f, g))
+                }
+                super::ObjectiveRequest::CostGradientHessian => {
+                    Ok(ObjectiveSample::cost_gradient_hessian(f, g, h))
+                }
+                super::ObjectiveRequest::GradientAndHessian => {
+                    if x[0].abs() < 1e-12 {
+                        Err(super::ObjectiveEvalError::recoverable(
+                            "synthetic accepted-step derivative refresh failure",
+                        ))
+                    } else {
+                        Ok(ObjectiveSample::cost_gradient_hessian(f, g, h))
+                    }
+                }
+            }
+        })
+        .with_tolerance(tol(1e-10))
+        .with_max_iterations(iters(20))
+        .with_bfgs_fallback(true);
+
+        let sol = solver
+            .run()
+            .expect("fallback should resume from accepted trial point");
+        assert!(sol.final_value <= 1e-12);
+        let seen = seen_points.lock().expect("lock seen points");
+        assert!(
+            seen.iter().skip_while(|&&v| (v - 1.0).abs() < 1e-12).any(|&v| v.abs() < 1e-12),
+            "expected ARC to evaluate the accepted trial point before fallback"
+        );
     }
 
     #[test]
@@ -5121,9 +6215,9 @@ mod tests {
                 }
             }
         })
-        .with_bounds(lower, upper, 1e-8)
-        .with_tolerance(1e-9)
-        .with_max_iterations(200);
+        .with_bounds(bounds(lower, upper, 1e-8))
+        .with_tolerance(tol(1e-9))
+        .with_max_iterations(iters(200));
 
         let sol = solver
             .run()
@@ -5157,8 +6251,8 @@ mod tests {
                 }
             }
         })
-        .with_tolerance(1e-6)
-        .with_max_iterations(400)
+        .with_tolerance(tol(1e-6))
+        .with_max_iterations(iters(400))
         .with_bfgs_fallback(true)
         .with_fallback_history(12);
 
@@ -5185,7 +6279,7 @@ mod tests {
                 }
             }
         })
-        .with_max_iterations(20)
+        .with_max_iterations(iters(20))
         .with_bfgs_fallback(false);
 
         let err = solver
@@ -5220,8 +6314,8 @@ mod tests {
                 }
             }
         })
-        .with_tolerance(1e-8)
-        .with_max_iterations(300)
+        .with_tolerance(tol(1e-8))
+        .with_max_iterations(iters(300))
         .with_bfgs_fallback(false);
 
         // ARC should survive recoverable trial-evaluation failures by increasing
@@ -5293,7 +6387,7 @@ mod tests {
     #[test]
     fn test_quadratic_bowl_converges() {
         let x0 = array![10.0, -5.0];
-        let BfgsSolution { final_point, .. } = Bfgs::new(x0, quadratic).run().unwrap();
+        let BfgsSolution { final_point, .. } = Bfgs::new(x0, bfgs_oracle(quadratic)).run().unwrap();
         assert_that!(&final_point[0]).is_close_to(0.0, 1e-5);
         assert_that!(&final_point[1]).is_close_to(0.0, 1e-5);
     }
@@ -5301,9 +6395,9 @@ mod tests {
     #[test]
     fn test_quadratic_still_converges_strongly() {
         let x0 = array![20.0, -30.0];
-        let sol = Bfgs::new(x0, quadratic)
-            .with_tolerance(1e-8)
-            .with_max_iterations(1000)
+        let sol = Bfgs::new(x0, bfgs_oracle(quadratic))
+            .with_tolerance(tol(1e-8))
+            .with_max_iterations(iters(1000))
             .run()
             .unwrap();
         assert_that!(&sol.final_point[0]).is_close_to(0.0, 1e-6);
@@ -5313,7 +6407,8 @@ mod tests {
     #[test]
     fn test_rosenbrock_converges() {
         let x0 = array![-1.2, 1.0];
-        let BfgsSolution { final_point, .. } = Bfgs::new(x0, rosenbrock).run().unwrap();
+        let BfgsSolution { final_point, .. } =
+            Bfgs::new(x0, bfgs_oracle(rosenbrock)).run().unwrap();
         assert_that!(&final_point[0]).is_close_to(1.0, 1e-5);
         assert_that!(&final_point[1]).is_close_to(1.0, 1e-5);
     }
@@ -5324,7 +6419,10 @@ mod tests {
     fn test_begin_at_minimum_terminates_immediately() {
         let x0 = array![0.0, 0.0];
         let BfgsSolution { iterations, .. } =
-            Bfgs::new(x0, quadratic).with_tolerance(1e-5).run().unwrap();
+            Bfgs::new(x0, bfgs_oracle(quadratic))
+                .with_tolerance(tol(1e-5))
+                .run()
+                .unwrap();
         assert_that(&iterations).is_less_than_or_equal_to(1);
     }
 
@@ -5332,8 +6430,8 @@ mod tests {
     fn test_max_iterations_error_is_returned() {
         let x0 = array![-1.2, 1.0];
         let max_iterations = 5;
-        let result = Bfgs::new(x0, rosenbrock)
-            .with_max_iterations(max_iterations)
+        let result = Bfgs::new(x0, bfgs_oracle(rosenbrock))
+            .with_max_iterations(iters(max_iterations))
             .run();
 
         match result {
@@ -5350,7 +6448,7 @@ mod tests {
     #[test]
     fn test_non_convex_function_is_handled() {
         let x0 = array![2.0];
-        let result = Bfgs::new(x0.clone(), non_convex_max).run();
+        let result = Bfgs::new(x0.clone(), bfgs_oracle(non_convex_max)).run();
         eprintln!("non_convex result: {:?}", result);
         // The robust solver should not fail. It gets stuck trying to minimize a function with no minimum.
         // It will hit the max iteration limit because it can't find steps that satisfy the descent condition.
@@ -5365,7 +6463,7 @@ mod tests {
     #[test]
     fn test_zero_curvature_is_handled() {
         let x0 = array![10.0, 10.0];
-        let result = Bfgs::new(x0, linear_function)
+        let result = Bfgs::new(x0, bfgs_oracle(linear_function))
             .with_flat_stall_exit(false, 3)
             .with_no_improve_stop(1e-8, usize::MAX)
             .run();
@@ -5389,8 +6487,8 @@ mod tests {
         };
         // Start at a point that will converge towards 0, triggering the NaN condition.
         let x0 = array![0.1];
-        let result = Bfgs::new(x0, nan_fn)
-            .with_tolerance(1e-15) // Very tight tolerance to force convergence towards 0
+        let result = Bfgs::new(x0, bfgs_oracle(nan_fn))
+            .with_tolerance(tol(1e-15)) // Very tight tolerance to force convergence towards 0
             .with_no_improve_stop(1e-8, 100)
             .run();
 
@@ -5406,14 +6504,17 @@ mod tests {
     #[test]
     fn test_linesearch_failed_reports_nonzero_attempts() {
         let x0 = array![0.0, 0.0, 0.0];
-        let mut solver = Bfgs::new(x0, |x: &Array1<f64>| {
-            let r2 = x.dot(x);
-            if r2 <= 1e-24 {
-                (833.403058988699, array![1.1751972450892738, 0.0, 0.0])
-            } else {
-                (f64::INFINITY, array![f64::NAN, f64::NAN, f64::NAN])
-            }
-        });
+        let mut solver = Bfgs::new(
+            x0,
+            bfgs_oracle(|x: &Array1<f64>| {
+                let r2 = x.dot(x);
+                if r2 <= 1e-24 {
+                    (833.403058988699, array![1.1751972450892738, 0.0, 0.0])
+                } else {
+                    (f64::INFINITY, array![f64::NAN, f64::NAN, f64::NAN])
+                }
+            }),
+        );
         let result = solver.run();
         match result {
             Err(
@@ -5448,8 +6549,8 @@ mod tests {
         let tolerance = 1e-6;
 
         // Run our implementation.
-        let our_res = Bfgs::new(x0.clone(), rosenbrock)
-            .with_tolerance(tolerance)
+        let our_res = Bfgs::new(x0.clone(), bfgs_oracle(rosenbrock))
+            .with_tolerance(tol(tolerance))
             .run()
             .unwrap();
 
@@ -5506,8 +6607,8 @@ mod tests {
         let tolerance = 1e-8;
 
         // Run our implementation.
-        match Bfgs::new(x0.clone(), quadratic)
-            .with_tolerance(tolerance)
+        match Bfgs::new(x0.clone(), bfgs_oracle(quadratic))
+            .with_tolerance(tol(tolerance))
             .run()
         {
             Ok(sol) => sol,
@@ -5563,15 +6664,15 @@ mod tests {
     #[test]
     fn test_ill_conditioned_problem_converges() {
         let x0 = array![1.0, 1000.0]; // Start far up the narrow valley
-        let res = Bfgs::new(x0, ill_conditioned_quadratic).run();
+        let res = Bfgs::new(x0, bfgs_oracle(ill_conditioned_quadratic)).run();
         assert!(res.is_ok() || matches!(res, Err(BfgsError::MaxIterationsReached { .. })));
     }
 
     #[test]
     fn test_singular_hessian_is_handled_gracefully() {
         let x0 = array![10.0, 20.0];
-        let result = Bfgs::new(x0, singular_hessian_function)
-            .with_tolerance(1e-8)
+        let result = Bfgs::new(x0, bfgs_oracle(singular_hessian_function))
+            .with_tolerance(tol(1e-8))
             .run();
 
         // The goal is to ensure the solver doesn't panic or return a numerical error.
@@ -5596,7 +6697,7 @@ mod tests {
     #[test]
     fn test_line_search_handles_inf() {
         let x0 = array![10.0]; // Start far from the wall and minimum.
-        let result = Bfgs::new(x0, wall_with_minimum).run();
+        let result = Bfgs::new(x0, bfgs_oracle(wall_with_minimum)).run();
         assert!(result.is_ok() || matches!(result, Err(BfgsError::MaxIterationsReached { .. })));
     }
 
@@ -5608,18 +6709,21 @@ mod tests {
         let mut core = super::BfgsCore::new(x0.clone());
         core.bounds = Some(super::BoxSpec::new(lower, upper, 1e-8));
         core.trust_radius = 10.0;
-        let mut obj = |x: &Array1<f64>| {
+        let fg = |x: &Array1<f64>| {
             let f = (x[0] - 2.0).powi(2);
             let g = array![2.0 * (x[0] - 2.0)];
             (f, g)
         };
+        let mut obj = bfgs_oracle(fg);
         let x_k = core.project_point(&x0);
-        let (f_k, g_k) = obj(&x_k);
+        let (f_k, g_k) = fg(&x_k);
         let mut b_inv = Array2::eye(1);
+        let mut oracle = super::ObjectiveOracleCache::new();
         let mut func_evals = 0;
         let mut grad_evals = 0;
         let res = core.try_trust_region_step(
             &mut obj,
+            &mut oracle,
             &mut b_inv,
             &x_k,
             f_k,
@@ -5643,7 +6747,7 @@ mod tests {
             (val, g)
         };
         let x0 = array![0.0, 0.0];
-        let res = Bfgs::new(x0, f).with_tolerance(1e-10).run();
+        let res = Bfgs::new(x0, bfgs_oracle(f)).with_tolerance(tol(1e-10)).run();
         assert!(res.is_ok() || matches!(res, Err(super::BfgsError::MaxIterationsReached { .. })));
     }
 
@@ -5660,7 +6764,7 @@ mod tests {
             (val, g)
         };
         let x0 = array![0.5, 0.5];
-        let res = Bfgs::new(x0, f).run();
+        let res = Bfgs::new(x0, bfgs_oracle(f)).run();
         assert!(res.is_ok() || matches!(res, Err(super::BfgsError::MaxIterationsReached { .. })));
     }
 
@@ -5669,7 +6773,7 @@ mod tests {
         // Ensure the internal RNG produces a roughly symmetric distribution.
         let x0 = array![0.0];
         let f = |x: &Array1<f64>| (x[0], array![1.0]);
-        let mut solver = super::Bfgs::new(x0, f).with_rng_seed(12345);
+        let mut solver = super::Bfgs::new(x0, bfgs_oracle(f)).with_rng_seed(12345);
         let mut sum = 0.0f64;
         let n = 20_000;
         for _ in 0..n {
