@@ -1,7 +1,7 @@
 //! Focused BFGS optimization API.
 
 pub use opt::{
-    Bfgs, BfgsError, BfgsSolution, Bounds, BoundsError, ConfigError, FirstOrderObjective,
-    LineSearchFailureReason, MaxIterations, ObjectiveEvalError, Problem, Profile, Tolerance,
-    optimize,
+    Bfgs, BfgsError, Bounds, BoundsError, ConfigError, FiniteDiffGradient, FirstOrderObjective,
+    FirstOrderSample, LineSearchFailureReason, MaxIterations, ObjectiveEvalError, Problem,
+    Profile, Solution, Tolerance, ZerothOrderObjective, optimize,
 };

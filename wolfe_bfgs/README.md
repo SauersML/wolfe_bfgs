@@ -11,7 +11,9 @@ This crate exposes the first-order API only:
 - `Problem`
 - `optimize`
 - `FirstOrderObjective`
-- `BfgsSolution`
+- `ZerothOrderObjective`
+- `FiniteDiffGradient`
+- `Solution`
 - `Bounds`, `Tolerance`, `MaxIterations`, `Profile`
 - `BfgsError` and related error/configuration types
 
@@ -23,39 +25,52 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-wolfe_bfgs = "0.3.0"
+wolfe_bfgs = "0.4.0"
 ```
 
 ## Example
 
 ```rust
 use wolfe_bfgs::{
-    optimize, BfgsSolution, FirstOrderObjective, MaxIterations, Problem, Profile, Tolerance,
+    optimize, FirstOrderObjective, FirstOrderSample, MaxIterations, Problem, Profile, Solution,
+    Tolerance, ZerothOrderObjective,
 };
 use ndarray::{array, Array1};
 
 struct Rosenbrock;
 
+impl ZerothOrderObjective for Rosenbrock {
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, wolfe_bfgs::ObjectiveEvalError> {
+        let a = 1.0;
+        let b = 100.0;
+        Ok((a - x[0]).powi(2) + b * (x[1] - x[0].powi(2)).powi(2))
+    }
+}
+
 impl FirstOrderObjective for Rosenbrock {
-    fn eval(
+    fn eval_grad(
         &mut self,
         x: &Array1<f64>,
-        grad_out: &mut Array1<f64>,
-    ) -> Result<f64, wolfe_bfgs::ObjectiveEvalError> {
+    ) -> Result<FirstOrderSample, wolfe_bfgs::ObjectiveEvalError> {
         let a = 1.0;
         let b = 100.0;
         let f = (a - x[0]).powi(2) + b * (x[1] - x[0].powi(2)).powi(2);
-        grad_out[0] = -2.0 * (a - x[0]) - 4.0 * b * (x[1] - x[0].powi(2)) * x[0];
-        grad_out[1] = 2.0 * b * (x[1] - x[0].powi(2));
-        Ok(f)
+        Ok(FirstOrderSample {
+            value: f,
+            gradient: array![
+                -2.0 * (a - x[0]) - 4.0 * b * (x[1] - x[0].powi(2)) * x[0],
+                2.0 * b * (x[1] - x[0].powi(2)),
+            ],
+        })
     }
 }
 
 let x0 = array![-1.2, 1.0];
 
-let BfgsSolution {
+let Solution {
     final_point: x_min,
     final_value,
+    final_gradient_norm: Some(grad_norm),
     ..
 } = optimize(Problem::new(x0, Rosenbrock))
     .with_tolerance(Tolerance::new(1e-6).unwrap())
@@ -67,7 +82,10 @@ let BfgsSolution {
 assert!((x_min[0] - 1.0).abs() < 1e-5);
 assert!((x_min[1] - 1.0).abs() < 1e-5);
 assert!(final_value.is_finite());
+assert!(grad_norm < 1e-5);
 ```
+
+For cost-only objectives, wrap a `ZerothOrderObjective` with `FiniteDiffGradient`.
 
 ## Relationship to `opt`
 
