@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 description = "Dense nonlinear optimization in Rust with BFGS, Newton trust-region, and ARC."
 readme = "README.md"
 documentation = "https://docs.rs/opt"
-repository = "https://github.com/SauersML/wolfe_bfgs"
+repository = "https://github.com/SauersML/opt"
 keywords = ["optimization", "bfgs", "newton"]
 categories = ["science", "algorithms"]
 

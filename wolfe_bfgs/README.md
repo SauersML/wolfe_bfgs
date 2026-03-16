@@ -2,9 +2,9 @@
 
 [![Crates.io](https://img.shields.io/crates/v/wolfe_bfgs.svg)](https://crates.io/crates/wolfe_bfgs)
 [![Docs.rs](https://docs.rs/wolfe_bfgs/badge.svg)](https://docs.rs/wolfe_bfgs)
-[![Build Status](https://github.com/SauersML/wolfe_bfgs/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/wolfe_bfgs/actions)
+[![Build Status](https://github.com/SauersML/opt/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/opt/actions)
 
-Focused dense BFGS optimization in Rust with a Strong Wolfe line search.
+Focused dense BFGS optimization in Rust with a Strong Wolfe line search, reexported from `opt`.
 
 This crate exposes the first-order API only:
 - `Bfgs`
@@ -89,5 +89,5 @@ For cost-only objectives, wrap a `ZerothOrderObjective` with `FiniteDiffGradient
 
 ## Relationship to `opt`
 
-`wolfe_bfgs` is the narrow package for users who only want the BFGS solver surface.
-The implementation lives in the same workspace as `opt`, which exposes the full optimization toolkit.
+`wolfe_bfgs` is a thin package for users who only want the BFGS solver surface.
+The implementation lives in the same workspace as `opt`, and this crate reexports the first-order API from `opt`.

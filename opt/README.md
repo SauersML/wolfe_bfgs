@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/opt.svg)](https://crates.io/crates/opt)
 [![Docs.rs](https://docs.rs/opt/badge.svg)](https://docs.rs/opt)
-[![Build Status](https://github.com/SauersML/wolfe_bfgs/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/wolfe_bfgs/actions)
+[![Build Status](https://github.com/SauersML/opt/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/opt/actions)
 
 Dense nonlinear optimization in Rust with:
 - `Bfgs` for first-order dense quasi-Newton optimization
@@ -100,9 +100,9 @@ Use `SecondOrderProblem` with `optimize` for automatic solver selection, or cons
 
 ## Workspace
 
-This repository is a workspace with two packages:
+This repository is the `opt` workspace with two packages:
 - `opt`: the full solver crate
-- `wolfe_bfgs`: a narrow BFGS-only crate layered on top of `opt`
+- `wolfe_bfgs`: a thin BFGS-only re-export crate layered on top of `opt`
 
 ## Testing
 

@@ -1,20 +1,13 @@
-# Rust Optimization Workspace
+# opt
 
-[![Build Status](https://github.com/SauersML/wolfe_bfgs/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/wolfe_bfgs/actions)
+[![Build Status](https://github.com/SauersML/opt/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/opt/actions)
 
-This repository is a Cargo workspace for two related crates:
+This repository is the Cargo workspace for two related crates:
 
-- [`opt`](./opt): the full nonlinear optimization crate with BFGS, Newton trust-region, and ARC
-- [`wolfe_bfgs`](./wolfe_bfgs): the focused BFGS-only crate
+- [`opt`](./opt): the full nonlinear optimization crate with BFGS, Newton trust-region, ARC, and fixed-point iteration
+- [`wolfe_bfgs`](./wolfe_bfgs): the thin BFGS-only crate that reexports the first-order surface from `opt`
 
-## Why two crates
-
-The repository originally centered on `wolfe_bfgs`, but the implementation grew into a broader optimization library. The split keeps:
-
-- `opt` as the primary crate for the full solver toolkit
-- `wolfe_bfgs` as the narrow package for users who only want the BFGS surface
-
-Both crates live in the same workspace and share the same implementation base.
+`opt` is the primary crate and the canonical repository identity. `wolfe_bfgs` remains in the same workspace as a narrower package for users who only want the BFGS API.
 
 ## Repository layout
 
