@@ -6,6 +6,8 @@
 
 Focused dense BFGS optimization in Rust with a Strong Wolfe line search, reexported from `opt`.
 
+This crate is the smaller companion package for users who only want the BFGS-first API.
+
 This crate exposes the first-order API only:
 - `Bfgs`
 - `Problem`
@@ -87,7 +89,7 @@ assert!(grad_norm < 1e-5);
 
 For cost-only objectives, wrap a `ZerothOrderObjective` with `FiniteDiffGradient`.
 
-## Relationship to `opt`
+## Implementation
 
-`wolfe_bfgs` is a thin package for users who only want the BFGS solver surface.
-The implementation lives in the same workspace as `opt`, and this crate reexports the first-order API from `opt`.
+`wolfe_bfgs` is published from the same repository as `opt`.
+It reexports the first-order API from `opt` rather than maintaining a separate implementation.

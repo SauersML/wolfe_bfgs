@@ -98,18 +98,12 @@ For cost-only objectives, wrap a `ZerothOrderObjective` with `FiniteDiffGradient
 
 Use `SecondOrderProblem` with `optimize` for automatic solver selection, or construct `NewtonTrustRegion` and `Arc` directly when you want explicit control over the algorithm choice.
 
-## Workspace
-
-This repository is the `opt` workspace with two packages:
-- `opt`: the full solver crate
-- `wolfe_bfgs`: a thin BFGS-only re-export crate layered on top of `opt`
-
 ## Testing
 
-Run the full workspace test suite from the repository root:
+Run the crate tests from the repository root:
 
 ```bash
-cargo test --workspace
+cargo test -p opt
 ```
 
 The crate also includes comparison tests against SciPy through `opt/optimization_harness.py`.
