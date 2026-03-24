@@ -30,13 +30,46 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install publish helper
+        run: |
+          cat > /tmp/publish_if_needed.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          manifest_path="$1"
+          package_name="$2"
+
+          version="$(
+            awk -F'"' '
+              /^\[package\]/ { in_package = 1; next }
+              /^\[/ && $0 != "[package]" { in_package = 0 }
+              in_package && $1 ~ /^version = / { print $2; exit }
+            ' "$manifest_path"
+          )"
+
+          if [ -z "$version" ]; then
+            echo "Could not determine version for $package_name from $manifest_path" >&2
+            exit 1
+          fi
+
+          if curl --silent --show-error --fail \
+            "https://crates.io/api/v1/crates/$package_name/$version" >/dev/null; then
+            echo "$package_name $version already exists on crates.io; skipping publish"
+            exit 0
+          fi
+
+          cargo publish -p "$package_name" --locked
+          EOF
+
+          chmod +x /tmp/publish_if_needed.sh
+
       - name: Publish `opt`
-        run: cargo publish -p opt --locked
+        run: /tmp/publish_if_needed.sh opt/Cargo.toml opt
 
       - name: Publish `wolfe_bfgs`
         run: |
           for attempt in $(seq 1 20); do
-            if cargo publish -p wolfe_bfgs --locked; then
+            if /tmp/publish_if_needed.sh wolfe_bfgs/Cargo.toml wolfe_bfgs; then
               exit 0
             fi
 
